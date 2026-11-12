@@ -1,5 +1,5 @@
 """실행: uvicorn app:app --host 127.0.0.1 --port 8000"""
-import os, re, shutil, tempfile
+import os, re, shutil, tempfile, time
 from typing import Literal, Optional
 import psycopg
 from dotenv import load_dotenv
@@ -24,7 +24,9 @@ _gem = None
 
 @app.exception_handler(errors.APIError)
 async def gemini_error(request, exc):
-    """Gemini 호출 실패를 500 대신 원인이 보이는 502로 반환 (모델명 오류, 한도 초과 등)."""
+    """Gemini 호출 실패를 500 대신 안내 문구로 반환. 과부하·한도 초과는 사용자용 안내만, 그 외는 원인 표시."""
+    if exc.code in (429, 503):
+        return JSONResponse({"detail": "AI 서버가 일시적으로 혼잡합니다. 잠시 후 다시 시도해 주세요."}, status_code=503)
     return JSONResponse({"detail": f"Gemini 오류: {str(exc)[:300]}"}, status_code=502)
 
 
@@ -39,6 +41,17 @@ def gem():
             raise HTTPException(503, ".env에 PARSE_MODEL, ANSWER_MODEL을 설정해 주세요")
         _gem = genai.Client(api_key=key)
     return _gem
+
+
+def generate(model, contents, config=None):
+    """Gemini 호출. 서버 과부하(503)·한도(429)는 잠시 후 3회까지 재시도, 계속 실패하면 예외(안내 문구로 변환됨)."""
+    for attempt in range(3):
+        try:
+            return gem().models.generate_content(model=model, contents=contents, config=config)
+        except errors.APIError as e:
+            if e.code not in (429, 503) or attempt == 2:
+                raise
+            time.sleep(2 * (attempt + 1))
 
 
 def connect():
@@ -126,7 +139,7 @@ def analyze_drawing(file: UploadFile = File()):
         raise HTTPException(400, "PDF 파일만 분석할 수 있습니다")
     if len(data) > 18 * 1024 * 1024:  # 인라인 전송 한도(요청 20MB)
         raise HTTPException(413, "파일이 너무 큽니다 (18MB 이하)")
-    r = gem().models.generate_content(
+    r = generate(
         model=ANSWER_MODEL,
         contents=[types.Part.from_bytes(data=data, mime_type="application/pdf"), DRAWING_PROMPT],
         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Spec))
@@ -164,14 +177,14 @@ def search(p: Parsed, family: Optional[str], extra: list[str], k=10):
 def ask(body: Ask):
     hist = history_text(body.history) or "(없음)"
     drw = f"\n도면에서 읽은 사양(사용자가 첨부, 도면에 없는 값은 되물어라):\n{body.drawing}\n" if body.drawing else ""
-    r = gem().models.generate_content(
+    r = generate(
         model=PARSE_MODEL, contents=f"{PARSE_PROMPT}\n이전 대화:\n{hist}\n{drw}\n질문: {body.question}",
         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Parsed))
     p: Parsed = r.parsed
     rows = search(p, body.family, glossary_terms(body.question, body.family))
     ctx = "\n---\n".join(f"[{x['code']} | {x['article']}{' | p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}"
                          for x in rows) or "(검색 결과 없음)"
-    out = gem().models.generate_content(
+    out = generate(
         model=ANSWER_MODEL, contents=ANSWER_PROMPT.format(q=body.question, p=p.model_dump_json(), ctx=ctx, hist=hist, drw=drw),
         config=types.GenerateContentConfig(max_output_tokens=4096))  # 생각 토큰 포함 한도라 넉넉히
     return {"parsed": p, "answer": out.text,
