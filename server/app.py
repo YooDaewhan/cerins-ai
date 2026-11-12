@@ -65,14 +65,15 @@ class Parsed(BaseModel):
 
 PARSE_PROMPT = ("사용자 질문을 규정 검색용 JSON으로 변환하라. 질문에 없는 값(특히 단위)은 절대 추정하지 말고 null로 둔다. "
                 "search_text에는 일상 표현을 규정에서 쓰는 정식 용어로 바꿔 쓴다. "
-                "이전 대화가 있으면 이번 질문은 그 후속이므로, 이전에 나온 수치·장비·조건도 합쳐서 추출한다.")
+                "이전 대화가 있으면 이번 질문은 그 후속이므로, 이전에 나온 수치·장비·조건도 합쳐서 추출한다. "
+                "도면 사양이 첨부돼 있으면 질문에 없는 값은 도면 사양에서 채운다.")
 ANSWER_PROMPT = """너는 인증 규정 검토 보조자다. 아래 '규정 발췌'에 있는 내용만 근거로 한국어로 답하라.
 형식: 1) 결론(해당/비해당/판단불가) 2) 근거 조항(규정코드·조항) 3) 미흡하거나 추가로 필요한 정보. 간결하게 쓴다.
 수치 비교는 비교한 두 값을 명시하라. 단위가 null이거나 발췌로 판단할 수 없으면 추측하지 말고 필요한 정보를 되물어라.
 
 이전 대화:
 {hist}
-
+{drw}
 질문: {q}
 추출된 조건: {p}
 규정 발췌:
@@ -88,6 +89,49 @@ class Ask(BaseModel):
     question: str
     family: Optional[str] = None
     history: list[Turn] = []   # 이전 대화 (화면이 최근 몇 개만 보냄)
+    drawing: Optional[str] = None  # 첨부한 도면에서 읽은 사양 요약 (/api/drawings 결과)
+
+
+# ---------- 도면 ----------
+class Spec(BaseModel):
+    equipment_type: Optional[str] = None
+    design_pressure: Qty
+    working_pressure: Qty
+    capacity: Qty                 # 용량(부피)
+    nominal_diameter: Qty         # 호칭지름
+    design_temperature: Qty
+    working_medium: Optional[str] = None
+    material: Optional[str] = None
+    notes: Optional[str] = None   # 읽기 어렵거나 불확실한 부분
+
+
+DRAWING_PROMPT = ("첨부한 기술 도면(PDF)에서 장비 사양을 읽어 JSON으로 답하라. 도면에 없거나 읽을 수 없는 값은 반드시 null로 두고 "
+                  "절대 추정하지 않는다. 숫자와 단위는 도면에 적힌 그대로 쓴다(단위를 바꾸거나 환산하지 않는다). "
+                  "글자가 작거나 흐려서 확신이 없는 값은 notes에 적는다.")
+
+
+def spec_text(s: Spec) -> str:
+    q = lambda x: None if x.value is None else f"{x.value:g} {x.unit or '(단위 불명)'}"
+    rows = [("장비", s.equipment_type), ("설계압력", q(s.design_pressure)), ("작동압력", q(s.working_pressure)),
+            ("용량", q(s.capacity)), ("호칭지름", q(s.nominal_diameter)), ("설계온도", q(s.design_temperature)),
+            ("작동 매체", s.working_medium), ("재질", s.material), ("메모", s.notes)]
+    return "\n".join(f"{k}: {v}" for k, v in rows if v)
+
+
+@app.post("/api/drawings")
+def analyze_drawing(file: UploadFile = File()):
+    """도면 PDF → Gemini가 사양 추출. 저장하지 않음(질문 때마다 화면이 요약 텍스트를 같이 보냄)."""
+    data = file.file.read()
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(400, "PDF 파일만 분석할 수 있습니다")
+    if len(data) > 18 * 1024 * 1024:  # 인라인 전송 한도(요청 20MB)
+        raise HTTPException(413, "파일이 너무 큽니다 (18MB 이하)")
+    r = gem().models.generate_content(
+        model=ANSWER_MODEL,
+        contents=[types.Part.from_bytes(data=data, mime_type="application/pdf"), DRAWING_PROMPT],
+        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Spec))
+    s: Spec = r.parsed
+    return {"spec": s, "text": spec_text(s) or "(읽을 수 있는 사양이 없습니다)"}
 
 
 def history_text(h: list[Turn]) -> str:
@@ -119,15 +163,16 @@ def search(p: Parsed, family: Optional[str], extra: list[str], k=10):
 @app.post("/api/ask")
 def ask(body: Ask):
     hist = history_text(body.history) or "(없음)"
+    drw = f"\n도면에서 읽은 사양(사용자가 첨부, 도면에 없는 값은 되물어라):\n{body.drawing}\n" if body.drawing else ""
     r = gem().models.generate_content(
-        model=PARSE_MODEL, contents=f"{PARSE_PROMPT}\n이전 대화:\n{hist}\n\n질문: {body.question}",
+        model=PARSE_MODEL, contents=f"{PARSE_PROMPT}\n이전 대화:\n{hist}\n{drw}\n질문: {body.question}",
         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Parsed))
     p: Parsed = r.parsed
     rows = search(p, body.family, glossary_terms(body.question, body.family))
     ctx = "\n---\n".join(f"[{x['code']} | {x['article']}{' | p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}"
                          for x in rows) or "(검색 결과 없음)"
     out = gem().models.generate_content(
-        model=ANSWER_MODEL, contents=ANSWER_PROMPT.format(q=body.question, p=p.model_dump_json(), ctx=ctx, hist=hist),
+        model=ANSWER_MODEL, contents=ANSWER_PROMPT.format(q=body.question, p=p.model_dump_json(), ctx=ctx, hist=hist, drw=drw),
         config=types.GenerateContentConfig(max_output_tokens=4096))  # 생각 토큰 포함 한도라 넉넉히
     return {"parsed": p, "answer": out.text,
             "sources": [{"code": x["code"], "article": x["article"], "page": x["page"]} for x in rows]}
