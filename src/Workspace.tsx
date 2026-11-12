@@ -1,4 +1,3 @@
-import { useState } from 'react'
 import Chat from './Chat'
 import { Glossary, Regulations } from './Admin'
 
@@ -7,16 +6,18 @@ const MENU = [
   ['regs', '규정 업데이트'],
   ['gloss', '용어 사전'],
 ] as const
-type Tab = (typeof MENU)[number][0]
+export type Tab = (typeof MENU)[number][0]
+export const TABS = MENU.map(([k]) => k)
 
-export default function Workspace({ family, onHome }: { family: string; onHome: () => void }) {
-  const [tab, setTab] = useState<Tab>('chat')
+type Props = { family: string; tab: Tab; onTab: (t: Tab) => void; onHome: () => void }
+
+export default function Workspace({ family, tab, onTab, onHome }: Props) {
   return (
     <div className="ws">
       <nav className="side">
         <h2>{family}</h2>
         {MENU.map(([k, label]) => (
-          <button key={k} className={tab === k ? 'cur' : ''} onClick={() => setTab(k)}>
+          <button key={k} className={tab === k ? 'cur' : ''} onClick={() => onTab(k)}>
             {label}
           </button>
         ))}
