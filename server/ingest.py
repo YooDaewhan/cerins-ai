@@ -1,7 +1,8 @@
 """CLI: python ingest.py 파일.pdf|.docx|.txt --family "TR CU" --code "TR CU 032/2013" --lang en [--version 2024-03]
 같은 파일(해시 동일)은 무시. 새 파일이면 active→previous, 기존 previous는 삭제(최대 2개 보존).
 API(app.py)도 ingest_file()을 그대로 사용."""
-import argparse, hashlib, os, re, shutil
+import argparse, hashlib, os, re
+from collections import Counter
 import psycopg
 from dotenv import load_dotenv
 from pgvector.psycopg import register_vector
@@ -85,6 +86,28 @@ def chunks(blks):
     if (f := flush()): yield f
 
 
+def detect(path, filename, family):
+    """규정 코드·언어 자동 판단. 파일명에 3자리 번호(032)가 있으면 '<family> 032/2013'
+    (연도는 본문에서 가장 많이 나온 '032/xxxx'), 없으면 파일명 그대로. 한글 문서는 ' (KO)'."""
+    stem = os.path.splitext(filename)[0].strip()
+    text = "\n".join(t for _, _, t in blocks(path))
+    n = max(len(text), 1)
+    ko = len(re.findall(r"[가-힣]", text)) / n
+    ru = len(re.findall(r"[А-Яа-яЁё]", text)) / n
+    lang = "ko" if ko > 0.1 else "ru" if ru > 0.3 else "en"
+    m = re.search(r"(?<!\d)(\d{3})(?!\d)", stem)
+    if not m:
+        return stem, lang  # 번호 없는 참고자료 등
+    num = m.group(1)
+    years = Counter(re.findall(rf"(?<!\d){num}/(\d{{4}})", text))
+    code = f"{family} {num}" + (f"/{years.most_common(1)[0][0]}" if years else "")
+    if "mandatory" in stem.lower():
+        code += " mandatory list"
+    if lang == "ko":
+        code += " (KO)"
+    return code, lang
+
+
 def ingest_file(model, path, family, code, lang=None, version=None, url=None):
     """적재 후 chunk 수 반환. 문제가 있으면 ValueError(메시지는 사용자에게 보여도 됨)."""
     h = hashlib.sha256(open(path, "rb").read()).hexdigest()
@@ -107,11 +130,7 @@ def ingest_file(model, path, family, code, lang=None, version=None, url=None):
             cur.executemany(
                 "INSERT INTO chunks (document_id,article,page,content,embedding) VALUES (%s,%s,%s,%s,%s)",
                 [(doc_id, art, pg, t, v) for (art, pg, t), v in zip(items, vecs)])
-    # 원본 보관 (근거 표시용). previous 삭제 시 파일 정리는 추후.
-    d = os.path.join(DATA, re.sub(r"\W+", "_", code))
-    os.makedirs(d, exist_ok=True)
-    shutil.copy(path, os.path.join(d, h + os.path.splitext(path)[1]))
-    return len(items)
+    return len(items)  # 원본 파일 보관은 호출 측(app.py의 업로드 기록)에서 처리
 
 
 if __name__ == "__main__":

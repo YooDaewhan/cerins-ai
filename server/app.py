@@ -1,9 +1,10 @@
 """실행: uvicorn app:app --host 127.0.0.1 --port 8000"""
-import os, re, tempfile
+import os, re, shutil, tempfile
 from typing import Literal, Optional
 import psycopg
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from google import genai
 from google.genai import types
 from pgvector.psycopg import register_vector
@@ -11,7 +12,7 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
-from ingest import ingest_file
+from ingest import DATA, detect, ingest_file
 
 load_dotenv()
 PARSE_MODEL = os.getenv("PARSE_MODEL", "gemini-flash-lite-latest")
@@ -116,21 +117,81 @@ def list_regulations(family: str):
 
 
 @app.post("/api/regulations")
-def upload_regulation(family: str = Form(), code: str = Form(), lang: Optional[str] = Form(None),
-                      version: Optional[str] = Form(None), file: UploadFile = File()):
+def upload_regulation(family: str = Form(), batch: str = Form(), file: UploadFile = File(),
+                      code: Optional[str] = Form(None), lang: Optional[str] = Form(None),
+                      version: Optional[str] = Form(None)):
+    """batch: 한 번의 업로드(여러 파일)를 묶는 ID. 코드·언어는 비우면 파일 내용/이름으로 자동 판단."""
     # 동기 함수라 FastAPI가 스레드풀에서 실행 → 임베딩 중에도 다른 요청은 처리됨
-    suffix = os.path.splitext(file.filename or "")[1].lower()
+    name = os.path.basename(file.filename or "file")
+    suffix = os.path.splitext(name)[1].lower()
     if suffix not in (".pdf", ".docx", ".txt"):
         raise HTTPException(400, "pdf, docx, txt 파일만 올릴 수 있습니다")
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as t:
         t.write(file.file.read())
+    code_ = code
     try:
-        n = ingest_file(emb, t.name, family, code.strip(), lang, version)
+        dcode, dlang = detect(t.name, name, family)
+        code_, lang = (code or dcode).strip(), lang or dlang
+        n = ingest_file(emb, t.name, family, code_, lang, version)
     except ValueError as e:
+        log_ingest(batch, family, code_ or name, name, version, 0, "skipped", str(e), None)
         raise HTTPException(400, str(e))
+    except Exception as e:
+        log_ingest(batch, family, code_ or name, name, version, 0, "error", repr(e)[:300], None)
+        raise
+    else:
+        log_ingest(batch, family, code_, name, version, n, "ok", None, t.name)
     finally:
         os.unlink(t.name)
-    return {"message": f"완료: {code} ({n}개 조각)"}
+    return {"message": f"{code_} ({n}개 조각)", "code": code_}
+
+
+def log_ingest(batch, family, code, filename, version, chunks, status, message, src):
+    """업로드 기록 + 원본 보관 (삭제되지 않음). 기록 실패가 업로드 결과를 막지 않게 무시."""
+    try:
+        with connect() as c:
+            lid = c.execute("INSERT INTO ingest_log (batch, family, code, filename, version_label, chunks, status, message) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                            (batch, family, code, filename, version, chunks, status, message)).fetchone()["id"]
+            if src:
+                safe = re.sub(r'[\\/:*?"<>|]', "_", filename)
+                rel = f"uploads/{lid}/{safe}"
+                os.makedirs(os.path.dirname(os.path.join(DATA, rel)), exist_ok=True)
+                shutil.copy(src, os.path.join(DATA, rel))
+                c.execute("UPDATE ingest_log SET stored_path=%s WHERE id=%s", (rel, lid))
+            prune_history(c, family)
+    except Exception:
+        pass
+
+
+KEEP_BATCHES = 10  # 최근 업데이트(업로드 1회 = 1건) 보관 개수
+
+
+def prune_history(c, family):
+    """오래된 업데이트 기록과 보관 원본을 삭제해 최근 KEEP_BATCHES건만 남긴다."""
+    old = [r["batch"] for r in c.execute(
+        "SELECT batch FROM ingest_log WHERE family=%s AND batch IS NOT NULL "
+        "GROUP BY batch ORDER BY max(id) DESC OFFSET %s", (family, KEEP_BATCHES)).fetchall()]
+    for b in old:
+        for r in c.execute("DELETE FROM ingest_log WHERE family=%s AND batch=%s RETURNING id", (family, b)).fetchall():
+            shutil.rmtree(os.path.join(DATA, "uploads", str(r["id"])), ignore_errors=True)
+
+
+@app.get("/api/regulations/log")
+def regulation_log(family: str, limit: int = 300):
+    with connect() as c:
+        return c.execute("SELECT id, batch, code, filename, chunks, status, message, (stored_path IS NOT NULL) AS has_file, "
+                         "created_at::text AS created_at FROM ingest_log WHERE family=%s ORDER BY id DESC LIMIT %s",
+                         (family, limit)).fetchall()
+
+
+@app.get("/api/regulations/file/{lid}")
+def download_original(lid: int):
+    with connect() as c:
+        r = c.execute("SELECT filename, stored_path FROM ingest_log WHERE id=%s", (lid,)).fetchone()
+    if not r or not r["stored_path"]:
+        raise HTTPException(404, "원본 파일이 없습니다")
+    return FileResponse(os.path.join(DATA, r["stored_path"]), filename=r["filename"])
 
 
 # ---------- 용어 사전 ----------

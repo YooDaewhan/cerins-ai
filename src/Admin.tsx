@@ -2,19 +2,9 @@ import { useCallback, useEffect, useState } from 'react'
 import { api, jsonInit } from './api'
 
 type Doc = { id: number; code: string; version_label: string | null; status: string; created_at: string }
+type Log = { id: number; batch: string; code: string; filename: string | null; chunks: number; status: string; message: string | null; has_file: boolean; created_at: string }
 type Term = { id: number; term: string; aliases: string[]; note: string | null }
-
-// 파일명 → 규정 코드/언어. 예: "TRCU 032_mandatory list.docx" → "TR CU 032/2013 mandatory list"
-const YEAR: Record<string, string> = { '004': '2011', '010': '2011', '012': '2011', '020': '2011', '032': '2013', '037': '2016', '043': '2017' }
-function guess(name: string): { code: string; lang: string } | null {
-  const base = name.replace(/\.[^.]+$/, '')
-  if (/한$/.test(base)) return null // 한글 번역본은 영문판과 내용이 중복되어 제외
-  const n = base.match(/(\d{3})/)?.[1]
-  if (n && YEAR[n]) {
-    return { code: `TR CU ${n}/${YEAR[n]}${/mandatory/i.test(base) ? ' mandatory list' : ''}`, lang: 'en' }
-  }
-  return /[가-힣]/.test(base) ? { code: `TR CU 참고자료 ${base}`, lang: 'ko' } : null
-}
+const STATUS: Record<string, string> = { ok: '성공', skipped: '건너뜀', error: '오류' }
 
 // 목록 조회 + 변경 후 새로고침 공통 훅
 function useList<T>(url: string) {
@@ -29,68 +19,107 @@ function useList<T>(url: string) {
   return { rows, err, load }
 }
 
+// 같은 batch(한 번의 업로드)끼리 묶기. rows는 최신순.
+function groupBatches(rows: Log[]) {
+  const map = new Map<string, Log[]>()
+  for (const r of rows) map.set(r.batch ?? `single-${r.id}`, [...(map.get(r.batch ?? `single-${r.id}`) ?? []), r])
+  return [...map.entries()].map(([id, items]) => ({ id, items }))
+}
+
+function History({ rows }: { rows: Log[] }) {
+  const [open, setOpen] = useState<string | null>(null)
+  const groups = groupBatches(rows)
+  if (!groups.length) return <p className="meta">아직 업데이트 기록이 없습니다.</p>
+  return (
+    <div>
+      {groups.map((g) => {
+        const ok = g.items.filter((i) => i.status === 'ok').length
+        const first = g.items[g.items.length - 1]
+        return (
+          <div key={g.id} style={{ borderBottom: '1px solid var(--border)' }}>
+            <button className="link" style={{ width: '100%', textAlign: 'left', padding: '10px 4px', color: 'inherit' }}
+              onClick={() => setOpen(open === g.id ? null : g.id)}>
+              {open === g.id ? '▾' : '▸'} {first.created_at.slice(0, 16)} — 파일 {g.items.length}개 (성공 {ok}
+              {g.items.length - ok > 0 ? `, 그 외 ${g.items.length - ok}` : ''})
+            </button>
+            {open === g.id && (
+              <table>
+                <tbody>
+                  {[...g.items].reverse().map((h) => (
+                    <tr key={h.id} title={h.message ?? ''}>
+                      <td>{h.code}</td>
+                      <td>{STATUS[h.status] ?? h.status}{h.status === 'ok' ? ` (${h.chunks}개)` : h.message ? ` — ${h.message}` : ''}</td>
+                      <td>{h.has_file ? <a href={`/api/regulations/file/${h.id}`}>{h.filename} ⬇</a> : h.filename}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 export function Regulations({ family }: { family: string }) {
   const { rows, err, load } = useList<Doc>(`/api/regulations?family=${encodeURIComponent(family)}`)
+  const hist = useList<Log>(`/api/regulations/log?family=${encodeURIComponent(family)}`)
   const [msg, setMsg] = useState('')
   const [busy, setBusy] = useState(false)
 
-  // 파일을 순서대로 올림. 코드를 비워 두면 파일명에서 추정(guess), 추정 불가면 건너뜀.
+  // 선택한 파일을 한 번의 업데이트(batch)로 묶어 순서대로 올림. 코드·언어는 서버가 자동 판단.
   async function upload(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault()
-    const f = new FormData(e.currentTarget)
-    const files = (e.currentTarget.elements.namedItem('file') as HTMLInputElement).files!
-    const typed = String(f.get('code')).trim()
+    const input = e.currentTarget.elements.namedItem('file') as HTMLInputElement
+    const files = Array.from(input.files ?? [])
+    const batch = Date.now().toString(36) + Math.random().toString(36).slice(2) // http에서는 crypto.randomUUID 사용 불가
     setBusy(true)
     const log: string[] = []
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i]
-      const g = guess(file.name)
-      const code = typed && files.length === 1 ? typed : g?.code
-      if (!code) { log.push(`건너뜀: ${file.name}`); setMsg(log.join('\n')); continue }
-      setMsg([...log, `(${i + 1}/${files.length}) ${file.name} 임베딩 중…`].join('\n'))
+    for (const [i, file] of files.entries()) {
+      setMsg([...log, `(${i + 1}/${files.length}) ${file.name} 처리 중…`].join('\n'))
       const fd = new FormData()
-      fd.append('family', family); fd.append('code', code); fd.append('file', file)
-      fd.append('lang', g?.lang ?? String(f.get('lang'))); fd.append('version', String(f.get('version') ?? ''))
+      fd.append('family', family)
+      fd.append('batch', batch)
+      fd.append('file', file)
       try {
         const r = await api<{ message: string }>('/api/regulations', { method: 'POST', body: fd })
-        log.push(`${file.name} → ${r.message}`)
+        log.push(`✔ ${file.name} → ${r.message}`)
       } catch (err) {
-        log.push(`${file.name} → 오류: ${(err as Error).message}`)
+        log.push(`✘ ${file.name} → ${(err as Error).message}`)
       }
-      setMsg(log.join('\n'))
     }
+    setMsg(log.join('\n'))
     setBusy(false)
     load()
+    hist.load()
   }
 
   return (
     <div className="page">
       <h2>규정 업데이트</h2>
-      <p>새 파일을 올리면 자동으로 임베딩되며, 현재 버전과 직전 버전만 보관됩니다.</p>
+      <p>파일을 선택해 올리면 자동으로 임베딩됩니다. 선택한 파일은 한 번의 업데이트로 기록되고 원본도 보관됩니다. 같은 규정은 현재와 직전 버전만 유지됩니다.</p>
       <form className="form" onSubmit={upload}>
         <input name="file" type="file" accept=".pdf,.docx,.txt" multiple required />
-        <input name="code" placeholder="규정 코드 (파일 1개일 때만. 비우면 파일명에서 자동 추정)" />
-        <input name="version" placeholder="버전/개정일 (선택, 예: 2024-03)" />
-        <select name="lang" defaultValue="en">
-          <option value="en">영어</option>
-          <option value="ru">러시아어</option>
-          <option value="ko">한국어</option>
-        </select>
         <button className="btn" disabled={busy}>
-          업로드
+          {busy ? '업로드 중…' : '업로드'}
         </button>
         {msg && <div className="meta" style={{ whiteSpace: 'pre-wrap' }}>{msg}</div>}
       </form>
+
+      <h3>업데이트 기록 (최근 10회)</h3>
+      <History rows={hist.rows} />
+
+      <h3 style={{ marginTop: 32 }}>현재 적용 중인 규정</h3>
       {err && <div className="err">{err}</div>}
       <table>
         <thead>
-          <tr><th>코드</th><th>버전</th><th>상태</th><th>등록일</th></tr>
+          <tr><th>코드</th><th>상태</th><th>등록일</th></tr>
         </thead>
         <tbody>
           {rows.map((d) => (
             <tr key={d.id}>
               <td>{d.code}</td>
-              <td>{d.version_label ?? '-'}</td>
               <td>{d.status === 'active' ? '현재' : '이전'}</td>
               <td>{d.created_at.slice(0, 10)}</td>
             </tr>
