@@ -25,6 +25,7 @@ _gem = None
 @app.exception_handler(errors.APIError)
 async def gemini_error(request, exc):
     """Gemini 호출 실패를 500 대신 안내 문구로 반환. 과부하·한도 초과는 사용자용 안내만, 그 외는 원인 표시."""
+    print(f"[gemini] {request.url.path} → {exc.code} {exc.status}: {str(exc)[:200]}", flush=True)  # 원인 확인용 (화면에는 안내만)
     if exc.code in (429, 503):
         return JSONResponse({"detail": "AI 서버가 일시적으로 혼잡합니다. 잠시 후 다시 시도해 주세요."}, status_code=503)
     return JSONResponse({"detail": f"Gemini 오류: {str(exc)[:300]}"}, status_code=502)
