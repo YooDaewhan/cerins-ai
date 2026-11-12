@@ -4,6 +4,18 @@ import { api, jsonInit } from './api'
 type Doc = { id: number; code: string; version_label: string | null; status: string; created_at: string }
 type Term = { id: number; term: string; aliases: string[]; note: string | null }
 
+// 파일명 → 규정 코드/언어. 예: "TRCU 032_mandatory list.docx" → "TR CU 032/2013 mandatory list"
+const YEAR: Record<string, string> = { '004': '2011', '010': '2011', '012': '2011', '020': '2011', '032': '2013', '037': '2016', '043': '2017' }
+function guess(name: string): { code: string; lang: string } | null {
+  const base = name.replace(/\.[^.]+$/, '')
+  if (/한$/.test(base)) return null // 한글 번역본은 영문판과 내용이 중복되어 제외
+  const n = base.match(/(\d{3})/)?.[1]
+  if (n && YEAR[n]) {
+    return { code: `TR CU ${n}/${YEAR[n]}${/mandatory/i.test(base) ? ' mandatory list' : ''}`, lang: 'en' }
+  }
+  return /[가-힣]/.test(base) ? { code: `TR CU 참고자료 ${base}`, lang: 'ko' } : null
+}
+
 // 목록 조회 + 변경 후 새로고침 공통 훅
 function useList<T>(url: string) {
   const [rows, setRows] = useState<T[]>([])
@@ -22,21 +34,33 @@ export function Regulations({ family }: { family: string }) {
   const [msg, setMsg] = useState('')
   const [busy, setBusy] = useState(false)
 
+  // 파일을 순서대로 올림. 코드를 비워 두면 파일명에서 추정(guess), 추정 불가면 건너뜀.
   async function upload(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault()
-    const fd = new FormData(e.currentTarget)
-    fd.append('family', family)
+    const f = new FormData(e.currentTarget)
+    const files = (e.currentTarget.elements.namedItem('file') as HTMLInputElement).files!
+    const typed = String(f.get('code')).trim()
     setBusy(true)
-    setMsg('업로드·임베딩 중… (수 분 걸릴 수 있음)')
-    try {
-      const r = await api<{ message: string }>('/api/regulations', { method: 'POST', body: fd })
-      setMsg(r.message)
-      load()
-    } catch (e) {
-      setMsg(`오류: ${(e as Error).message}`)
-    } finally {
-      setBusy(false)
+    const log: string[] = []
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]
+      const g = guess(file.name)
+      const code = typed && files.length === 1 ? typed : g?.code
+      if (!code) { log.push(`건너뜀: ${file.name}`); setMsg(log.join('\n')); continue }
+      setMsg([...log, `(${i + 1}/${files.length}) ${file.name} 임베딩 중…`].join('\n'))
+      const fd = new FormData()
+      fd.append('family', family); fd.append('code', code); fd.append('file', file)
+      fd.append('lang', g?.lang ?? String(f.get('lang'))); fd.append('version', String(f.get('version') ?? ''))
+      try {
+        const r = await api<{ message: string }>('/api/regulations', { method: 'POST', body: fd })
+        log.push(`${file.name} → ${r.message}`)
+      } catch (err) {
+        log.push(`${file.name} → 오류: ${(err as Error).message}`)
+      }
+      setMsg(log.join('\n'))
     }
+    setBusy(false)
+    load()
   }
 
   return (
@@ -44,18 +68,18 @@ export function Regulations({ family }: { family: string }) {
       <h2>규정 업데이트</h2>
       <p>새 파일을 올리면 자동으로 임베딩되며, 현재 버전과 직전 버전만 보관됩니다.</p>
       <form className="form" onSubmit={upload}>
-        <input name="code" required placeholder="규정 코드 (예: TR CU 032/2013)" />
-        <input name="version" placeholder="버전/개정일 (예: 2024-03)" />
-        <select name="lang" defaultValue="ru">
-          <option value="ru">러시아어</option>
+        <input name="file" type="file" accept=".pdf,.docx,.txt" multiple required />
+        <input name="code" placeholder="규정 코드 (파일 1개일 때만. 비우면 파일명에서 자동 추정)" />
+        <input name="version" placeholder="버전/개정일 (선택, 예: 2024-03)" />
+        <select name="lang" defaultValue="en">
           <option value="en">영어</option>
+          <option value="ru">러시아어</option>
           <option value="ko">한국어</option>
         </select>
-        <input name="file" type="file" accept=".pdf,.txt" required />
         <button className="btn" disabled={busy}>
           업로드
         </button>
-        {msg && <div className="meta">{msg}</div>}
+        {msg && <div className="meta" style={{ whiteSpace: 'pre-wrap' }}>{msg}</div>}
       </form>
       {err && <div className="err">{err}</div>}
       <table>

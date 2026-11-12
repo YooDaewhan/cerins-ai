@@ -4,5 +4,6 @@ python-multipart
 psycopg[binary]
 pgvector
 pypdf
+python-docx
 google-genai
 python-dotenv

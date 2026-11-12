@@ -1,5 +1,5 @@
 """실행: uvicorn app:app --host 127.0.0.1 --port 8000"""
-import os, tempfile
+import os, re, tempfile
 from typing import Literal, Optional
 import psycopg
 from dotenv import load_dotenv
@@ -82,13 +82,14 @@ def glossary_terms(question: str, family: Optional[str]) -> list[str]:
 def search(p: Parsed, family: Optional[str], extra: list[str], k=5):
     sql = ("SELECT d.code, c.article, c.page, c.content FROM chunks c JOIN documents d ON d.id=c.document_id "
            "WHERE d.status='active' AND (%s::text IS NULL OR d.family=%s) "
-           "AND (%s::text IS NULL OR d.code ILIKE %s) "
+           "AND (%s::text[] IS NULL OR d.code ~ ANY(%s::text[])) "
            "ORDER BY c.embedding <=> %s LIMIT %s")
     v = emb.encode(" ".join([p.search_text, *extra]), normalize_embeddings=True)
-    like = f"{p.regulation}%" if p.regulation else None
+    # "TR CU 032" 같은 표기는 번호(032)만 뽑아 코드와 매칭 (TR CU/TR EAEU 표기 차이 흡수)
+    pats = [rf"\m{n}\M" for n in re.findall(r"\d{3}", p.regulation or "")] or None
     with connect() as c:
         c.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")  # 필터 시 결과 부족 방지
-        return c.execute(sql, (family, family, like, like, v, k)).fetchall()
+        return c.execute(sql, (family, family, pats, pats, v, k)).fetchall()
 
 
 @app.post("/api/ask")
@@ -119,8 +120,8 @@ def upload_regulation(family: str = Form(), code: str = Form(), lang: Optional[s
                       version: Optional[str] = Form(None), file: UploadFile = File()):
     # 동기 함수라 FastAPI가 스레드풀에서 실행 → 임베딩 중에도 다른 요청은 처리됨
     suffix = os.path.splitext(file.filename or "")[1].lower()
-    if suffix not in (".pdf", ".txt"):
-        raise HTTPException(400, "pdf 또는 txt 파일만 올릴 수 있습니다")
+    if suffix not in (".pdf", ".docx", ".txt"):
+        raise HTTPException(400, "pdf, docx, txt 파일만 올릴 수 있습니다")
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as t:
         t.write(file.file.read())
     try:
