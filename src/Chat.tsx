@@ -21,7 +21,9 @@ export default function Chat({ family }: { family: string }) {
     setBusy(true)
     setMsgs((m) => [...m, { role: 'me', text: question }])
     try {
-      const r = await api<Ask>('/api/ask', jsonInit('POST', { question, family }))
+      // 오류 메시지를 뺀 최근 대화를 함께 보내 후속 질문이 앞 조건을 이어가게 함
+      const history = msgs.filter((m) => !m.error).slice(-6).map((m) => ({ role: m.role, text: m.text }))
+      const r = await api<Ask>('/api/ask', jsonInit('POST', { question, family, history }))
       setMsgs((m) => [...m, { role: 'ai', text: r.answer, sources: r.sources }])
     } catch (e) {
       setMsgs((m) => [...m, { role: 'ai', text: `오류: ${(e as Error).message}`, error: true }])

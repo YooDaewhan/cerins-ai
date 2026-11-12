@@ -4,9 +4,9 @@ from typing import Literal, Optional
 import psycopg
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 from pgvector.psycopg import register_vector
 from psycopg.rows import dict_row
 from pydantic import BaseModel
@@ -15,11 +15,17 @@ from sentence_transformers import SentenceTransformer
 from ingest import DATA, detect, ingest_file
 
 load_dotenv()
-PARSE_MODEL = os.getenv("PARSE_MODEL", "gemini-flash-lite-latest")
-ANSWER_MODEL = os.getenv("ANSWER_MODEL", "gemini-flash-latest")
+PARSE_MODEL = os.getenv("PARSE_MODEL")    # .env에서 지정 (모델 이름은 직접 조회해서 정함)
+ANSWER_MODEL = os.getenv("ANSWER_MODEL")
 emb = SentenceTransformer("BAAI/bge-m3", device="cpu")
 app = FastAPI()
 _gem = None
+
+
+@app.exception_handler(errors.APIError)
+async def gemini_error(request, exc):
+    """Gemini 호출 실패를 500 대신 원인이 보이는 502로 반환 (모델명 오류, 한도 초과 등)."""
+    return JSONResponse({"detail": f"Gemini 오류: {str(exc)[:300]}"}, status_code=502)
 
 
 def gem():
@@ -29,6 +35,8 @@ def gem():
         key = os.getenv("GEMINI_API_KEY")
         if not key:
             raise HTTPException(503, "GEMINI_API_KEY가 설정되지 않았습니다")
+        if not PARSE_MODEL or not ANSWER_MODEL:
+            raise HTTPException(503, ".env에 PARSE_MODEL, ANSWER_MODEL을 설정해 주세요")
         _gem = genai.Client(api_key=key)
     return _gem
 
@@ -56,10 +64,14 @@ class Parsed(BaseModel):
 
 
 PARSE_PROMPT = ("사용자 질문을 규정 검색용 JSON으로 변환하라. 질문에 없는 값(특히 단위)은 절대 추정하지 말고 null로 둔다. "
-                "search_text에는 일상 표현을 규정에서 쓰는 정식 용어로 바꿔 쓴다.\n질문: ")
+                "search_text에는 일상 표현을 규정에서 쓰는 정식 용어로 바꿔 쓴다. "
+                "이전 대화가 있으면 이번 질문은 그 후속이므로, 이전에 나온 수치·장비·조건도 합쳐서 추출한다.")
 ANSWER_PROMPT = """너는 인증 규정 검토 보조자다. 아래 '규정 발췌'에 있는 내용만 근거로 한국어로 답하라.
-형식: 1) 결론(해당/비해당/판단불가) 2) 근거 조항(규정코드·조항·페이지) 3) 미흡하거나 추가로 필요한 정보.
+형식: 1) 결론(해당/비해당/판단불가) 2) 근거 조항(규정코드·조항) 3) 미흡하거나 추가로 필요한 정보. 간결하게 쓴다.
 수치 비교는 비교한 두 값을 명시하라. 단위가 null이거나 발췌로 판단할 수 없으면 추측하지 말고 필요한 정보를 되물어라.
+
+이전 대화:
+{hist}
 
 질문: {q}
 추출된 조건: {p}
@@ -67,9 +79,20 @@ ANSWER_PROMPT = """너는 인증 규정 검토 보조자다. 아래 '규정 발�
 {ctx}"""
 
 
+class Turn(BaseModel):
+    role: Literal["me", "ai"]
+    text: str
+
+
 class Ask(BaseModel):
     question: str
     family: Optional[str] = None
+    history: list[Turn] = []   # 이전 대화 (화면이 최근 몇 개만 보냄)
+
+
+def history_text(h: list[Turn]) -> str:
+    """최근 6개 메시지만, 각 600자까지. 후속 질문("용량은 0.01 m3예요")에서 앞 조건을 잊지 않게 함."""
+    return "\n".join(f"{'사용자' if t.role == 'me' else 'AI'}: {t.text[:600]}" for t in h[-6:])
 
 
 def glossary_terms(question: str, family: Optional[str]) -> list[str]:
@@ -80,7 +103,7 @@ def glossary_terms(question: str, family: Optional[str]) -> list[str]:
     return [a for r in rows if r["term"] in question for a in r["aliases"]]
 
 
-def search(p: Parsed, family: Optional[str], extra: list[str], k=5):
+def search(p: Parsed, family: Optional[str], extra: list[str], k=10):
     sql = ("SELECT d.code, c.article, c.page, c.content FROM chunks c JOIN documents d ON d.id=c.document_id "
            "WHERE d.status='active' AND (%s::text IS NULL OR d.family=%s) "
            "AND (%s::text[] IS NULL OR d.code ~ ANY(%s::text[])) "
@@ -95,15 +118,17 @@ def search(p: Parsed, family: Optional[str], extra: list[str], k=5):
 
 @app.post("/api/ask")
 def ask(body: Ask):
+    hist = history_text(body.history) or "(없음)"
     r = gem().models.generate_content(
-        model=PARSE_MODEL, contents=PARSE_PROMPT + body.question,
+        model=PARSE_MODEL, contents=f"{PARSE_PROMPT}\n이전 대화:\n{hist}\n\n질문: {body.question}",
         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Parsed))
     p: Parsed = r.parsed
     rows = search(p, body.family, glossary_terms(body.question, body.family))
-    ctx = "\n---\n".join(f"[{x['code']} | {x['article']} | p.{x['page']}]\n{x['content']}" for x in rows) or "(검색 결과 없음)"
+    ctx = "\n---\n".join(f"[{x['code']} | {x['article']}{' | p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}"
+                         for x in rows) or "(검색 결과 없음)"
     out = gem().models.generate_content(
-        model=ANSWER_MODEL, contents=ANSWER_PROMPT.format(q=body.question, p=p.model_dump_json(), ctx=ctx),
-        config=types.GenerateContentConfig(max_output_tokens=1200))
+        model=ANSWER_MODEL, contents=ANSWER_PROMPT.format(q=body.question, p=p.model_dump_json(), ctx=ctx, hist=hist),
+        config=types.GenerateContentConfig(max_output_tokens=4096))  # 생각 토큰 포함 한도라 넉넉히
     return {"parsed": p, "answer": out.text,
             "sources": [{"code": x["code"], "article": x["article"], "page": x["page"]} for x in rows]}
 
