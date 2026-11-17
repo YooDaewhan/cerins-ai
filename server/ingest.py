@@ -123,7 +123,13 @@ def store_chunks(conn, model, items, h, family, code, lang, version, url):
     """items=(article, page, text) 목록을 문서 1건으로 저장. 같은 코드는 현재·직전 버전만 유지."""
     if conn.execute("SELECT 1 FROM documents WHERE code=%s AND file_hash=%s", (code, h)).fetchone():
         raise ValueError("이미 적재된 파일입니다 (변경 없음)")
-    vecs = model.encode([t for _, _, t in items], batch_size=16, normalize_embeddings=True)
+    # 같은 코드의 기존 조각과 내용이 같으면 임베딩 재사용 → 개정 때 바뀐 조각만 계산 (CPU 임베딩이 적재 시간의 대부분)
+    old = {r[0]: r[1] for r in conn.execute(
+        "SELECT c.content, c.embedding FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.code=%s", (code,))}
+    need = list(dict.fromkeys(t for _, _, t in items if t not in old))
+    if need:
+        old.update(zip(need, model.encode(need, batch_size=16, normalize_embeddings=True)))
+    vecs = [old[t] for _, _, t in items]
     conn.execute("DELETE FROM documents WHERE code=%s AND status='previous'", (code,))
     conn.execute("UPDATE documents SET status='previous' WHERE code=%s AND status='active'", (code,))
     doc_id = conn.execute(
