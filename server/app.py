@@ -89,6 +89,8 @@ class Parsed(BaseModel):
     size: Qty
     pressure: Qty
     search_text: str                       # 규정 본문 검색용 문장 (규정에서 쓰는 용어로 바꿔 쓴다)
+    # HS 품목분류 검색용: 품명·기능·작동 방식만 (규격·압력·재질 제외), 한국어와 영어 함께. 예: "볼밸브 ball valve, 수동 manually operated"
+    product: Optional[str] = None
 
 
 PARSE_PROMPT = ("사용자 질문을 규정 검색용 JSON으로 변환하라. 질문에 없는 값(특히 단위)은 절대 추정하지 말고 null로 둔다. "
@@ -237,9 +239,11 @@ def ask(body: Ask):
     gl = glossary_terms(body.question, body.family if one else None)
     hs = []
     if body.family == "HS":
-        rows = search(p, "HS", gl)
+        rows = search(p.model_copy(update={"search_text": p.product or p.search_text}), "HS", gl)
     else:  # 품목과 가까운 HS 호를 참고로 붙이고, 그 호를 코드로 나열한 규정 조항(ТН ВЭД 표)도 찾아 넣음
-        hs = search(p.model_copy(update={"regulation": None}), "HS", glossary_terms(body.question, "HS"), k=3 if one else 5)
+        # 규격·압력이 섞인 search_text로 찾으면 '볼밸브'가 볼베어링·스테인리스 강판 쪽으로 끌려가서 품명만 씀
+        hs = search(p.model_copy(update={"regulation": None, "search_text": p.product or p.search_text}),
+                    "HS", glossary_terms(body.question, "HS"), k=3 if one else 5)
         heads = {x["article"][:4] for x in hs} | codes_in(body.question + "\n" + hist)
         rows = []
         # 통합 검토는 규정마다 몇 개씩 따로 뽑음 (한꺼번에 뽑으면 조각 많은 규정이 결과를 독차지함)
