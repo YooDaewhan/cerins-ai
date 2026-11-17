@@ -214,7 +214,6 @@ def hs_upload(model, path, filename, family):
     h = hashlib.sha256(open(xlsx, "rb").read() + open(js, "rb").read()).hexdigest()
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         register_vector(conn)
-        conn.execute(HS_TABLE)
         n = store_chunks(conn, model, items, h, family, "HSK", "ko", ver, None)
         conn.execute("DELETE FROM hs_codes")
         with conn.cursor() as cur:

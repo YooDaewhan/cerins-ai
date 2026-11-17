@@ -61,9 +61,10 @@ def connect():
     return c
 
 
-try:  # HS 검색 탭이 적재 전에도 빈 결과로 동작하도록 테이블만 미리 생성
+try:  # HS 검색 탭이 적재 전에도 빈 결과로 동작하도록 테이블이 없을 때만 생성 (스키마 권한 없으면 관리자가 HS_TABLE 실행)
     with connect() as _c:
-        _c.execute(HS_TABLE)
+        if not _c.execute("SELECT to_regclass('hs_codes') AS t").fetchone()["t"]:
+            _c.execute(HS_TABLE)
 except Exception as e:
     print(f"[hs] 테이블 생성 실패: {e!r}", flush=True)
 
