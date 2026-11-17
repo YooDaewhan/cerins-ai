@@ -5,7 +5,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     const t = await r.text()
     let detail: unknown
     try { detail = JSON.parse(t).detail } catch { /* JSON이 아님 */ }
-    throw new Error(typeof detail === 'string' ? detail : `${r.status} ${t}`)
+    throw Object.assign(new Error(typeof detail === 'string' ? detail : `${r.status} ${t}`), { status: r.status })
   }
   return r.json()
 }

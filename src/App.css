@@ -71,4 +71,10 @@ button.chip { background: none; color: inherit; }
 .md-table td:first-child { min-width: 7em; }
 .md-table tr:last-child td { border-bottom: 0; }
 .md-table td + td, .md-table th + th { border-left: 1px solid var(--border); }
-details.meta summary { cursor: pointer; }
+details summary { cursor: pointer; }
+.model-tag { display: inline-block; margin-right: 8px; padding: 0 8px; border-radius: 99px; background: var(--accent-bg); color: var(--accent); font-size: 0.85em; }
+.meta details { display: inline; }
+.retry { margin-top: 6px; font-size: 0.9em; }
+.retry .chip { cursor: pointer; }
+.composer-bar { max-width: 780px; margin: 0 auto 6px; display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center; }
+.composer-bar select { padding: 2px 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: inherit; }

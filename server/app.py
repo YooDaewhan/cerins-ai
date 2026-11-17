@@ -15,19 +15,19 @@ from sentence_transformers import SentenceTransformer
 from ingest import DATA, HS_TABLE, detect, hs_upload, ingest_file
 
 load_dotenv()
-PARSE_MODEL = os.getenv("PARSE_MODEL")    # .env에서 지정 (모델 이름은 직접 조회해서 정함)
+# 기본 모델. 화면에서 질문마다 답변 모델을 고를 수 있고, .env 값은 기본값일 뿐(없으면 사용 가능 목록에서 자동 선택)
+PARSE_MODEL = os.getenv("PARSE_MODEL")
 ANSWER_MODEL = os.getenv("ANSWER_MODEL")
 emb = SentenceTransformer("BAAI/bge-m3", device="cpu")
 app = FastAPI()
 _gem = None
+_models: tuple[float, list[str]] = (0, [])
 
 
 @app.exception_handler(errors.APIError)
 async def gemini_error(request, exc):
-    """Gemini 호출 실패를 500 대신 안내 문구로 반환. 과부하·한도 초과는 사용자용 안내만, 그 외는 원인 표시."""
-    print(f"[gemini] {request.url.path} → {exc.code} {exc.status}: {str(exc)[:200]}", flush=True)  # 원인 확인용 (화면에는 안내만)
-    if exc.code in (429, 503):
-        return JSONResponse({"detail": "AI 서버가 일시적으로 혼잡합니다. 잠시 후 다시 시도해 주세요."}, status_code=503)
+    """Gemini 호출 실패를 500 대신 안내 문구로 반환."""
+    print(f"[gemini] {request.url.path} → {exc.code} {exc.status}: {str(exc)[:200]}", flush=True)
     return JSONResponse({"detail": f"Gemini 오류: {str(exc)[:300]}"}, status_code=502)
 
 
@@ -38,27 +38,60 @@ def gem():
         key = os.getenv("GEMINI_API_KEY")
         if not key:
             raise HTTPException(503, "GEMINI_API_KEY가 설정되지 않았습니다")
-        if not PARSE_MODEL or not ANSWER_MODEL:
-            raise HTTPException(503, ".env에 PARSE_MODEL, ANSWER_MODEL을 설정해 주세요")
         _gem = genai.Client(api_key=key)
     return _gem
 
 
-def generate(model, contents, config=None):
-    """Gemini 호출. 서버 과부하(503)·한도(429)는 잠시 후 재시도하고, 그래도 안 되면 PARSE_MODEL(가벼운 모델)로 대신 호출.
-    flash 계열이 수십 분씩 503을 내는 동안 lite는 정상인 경우가 많음. 둘 다 실패하면 예외(안내 문구로 변환됨)."""
+TEXT_MODEL = re.compile(r"^gemini-(?!.*(image|tts|embed|audio|live|banana|omni))")
+
+
+def models() -> list[str]:
+    """이 키로 쓸 수 있는 텍스트 생성 모델 (1시간 캐시)."""
+    global _models
+    if time.time() - _models[0] > 3600 or not _models[1]:
+        names = [m.name.split("/")[-1] for m in gem().models.list() if "generateContent" in (m.supported_actions or [])]
+        _models = (time.time(), sorted((n for n in names if TEXT_MODEL.match(n)), reverse=True))
+    return _models[1]
+
+
+def defaults() -> tuple[str, str]:
+    """(질문 해석용, 답변용) 기본 모델. .env 값이 있으면 그것, 없으면 목록에서 lite / 일반 flash."""
+    ms = models()
+    lite = PARSE_MODEL or next((m for m in ms if "flash-lite" in m), ms[0])
+    main = ANSWER_MODEL or next((m for m in ms if "flash" in m and "lite" not in m), ms[0])
+    return lite, main
+
+
+@app.get("/api/models")
+def list_models():
+    lite, main = defaults()
+    return {"models": models(), "answer": main, "parse": lite}
+
+
+def generate(model, contents, config=None, fallback=None):
+    """Gemini 호출. 과부하(503)·한도(429)는 잠시 후 2번 더 시도. 그래도 안 되면 fallback 모델로,
+    없으면 503 '모델 혼잡'으로 끝내서 화면이 사용자에게 다른 모델로 바꿀지 묻게 함."""
     for attempt in range(3):
         try:
             return gem().models.generate_content(model=model, contents=contents, config=config)
         except errors.APIError as e:
             if e.code not in (429, 503):
                 raise
+            print(f"[gemini] {model} → {e.code} (시도 {attempt + 1})", flush=True)
             if attempt == 2:
-                if model == PARSE_MODEL:
-                    raise
-                print(f"[gemini] {model} 혼잡 → {PARSE_MODEL}로 대체", flush=True)
-                return generate(PARSE_MODEL, contents, config)
+                if fallback and fallback != model:
+                    return generate(fallback, contents, config)
+                raise HTTPException(503, f"{model} 모델이 지금 혼잡합니다 ({'요청 한도 초과' if e.code == 429 else '서버 과부하'}).")
             time.sleep(2 * (attempt + 1))
+
+
+def pick(model: Optional[str]) -> str:
+    """화면에서 고른 답변 모델 (목록에 없는 이름은 거부), 없으면 기본값."""
+    if not model:
+        return defaults()[1]
+    if model not in models():
+        raise HTTPException(400, f"사용할 수 없는 모델입니다: {model}")
+    return model
 
 
 def connect():
@@ -171,6 +204,7 @@ class Ask(BaseModel):
     family: Optional[str] = None
     history: list[Turn] = []   # 이전 대화 (화면이 최근 몇 개만 보냄)
     drawing: Optional[str] = None  # 첨부한 도면에서 읽은 사양 요약 (/api/drawings 결과)
+    model: Optional[str] = None    # 화면에서 고른 답변 모델 (없으면 기본값)
 
 
 # ---------- 도면 ----------
@@ -203,7 +237,7 @@ def spec_text(s: Spec) -> str:
 
 
 @app.post("/api/drawings")
-def analyze_drawing(file: UploadFile = File()):
+def analyze_drawing(file: UploadFile = File(), model: Optional[str] = Form(None)):
     """도면 PDF → Gemini가 사양 추출. 저장하지 않음(질문 때마다 화면이 요약 텍스트를 같이 보냄)."""
     data = file.file.read()
     if not (file.filename or "").lower().endswith(".pdf"):
@@ -211,11 +245,11 @@ def analyze_drawing(file: UploadFile = File()):
     if len(data) > 18 * 1024 * 1024:  # 인라인 전송 한도(요청 20MB)
         raise HTTPException(413, "파일이 너무 큽니다 (18MB 이하)")
     r = generate(
-        model=ANSWER_MODEL,
+        model=(m := pick(model)),
         contents=[types.Part.from_bytes(data=data, mime_type="application/pdf"), DRAWING_PROMPT],
         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Spec))
     s: Spec = r.parsed
-    return {"spec": s, "text": spec_text(s) or "(읽을 수 있는 사양이 없습니다)"}
+    return {"spec": s, "text": spec_text(s) or "(읽을 수 있는 사양이 없습니다)", "model": m}
 
 
 def history_text(h: list[Turn]) -> str:
@@ -249,7 +283,7 @@ def ask(body: Ask):
     hist = history_text(body.history) or "(없음)"
     drw = f"\n도면에서 읽은 사양(사용자가 첨부, 도면에 없는 값은 되물어라):\n{body.drawing}\n" if body.drawing else ""
     r = generate(
-        model=PARSE_MODEL, contents=f"{PARSE_PROMPT}\n이전 대화:\n{hist}\n{drw}\n질문: {body.question}",
+        model=defaults()[0], fallback=(m := pick(body.model)), contents=f"{PARSE_PROMPT}\n이전 대화:\n{hist}\n{drw}\n질문: {body.question}",
         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Parsed))
     p: Parsed = r.parsed
     one = body.family not in (None, "ALL")  # ALL: 통합 검토 (HS 코드 + 등록된 모든 규정)
@@ -276,10 +310,10 @@ def ask(body: Ask):
         f"{' · p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}" for x in xs)
     prompt = HS_ANSWER_PROMPT if body.family == "HS" else ANSWER_PROMPT if one else ALL_PROMPT
     out = generate(
-        model=ANSWER_MODEL, contents=prompt.format(
+        model=m, contents=prompt.format(
             q=body.question, p=p.model_dump_json(), ctx=fmt(rows) or "(검색 결과 없음)", hs=fmt(hs) or "(없음)", hist=hist, drw=drw),
         config=types.GenerateContentConfig(max_output_tokens=6144))  # 생각 토큰 포함 한도라 넉넉히
-    return {"parsed": p, "answer": out.text,
+    return {"parsed": p, "answer": out.text, "model": m,
             "sources": [{"code": x["code"], "article": x["article"], "page": x["page"]} for x in rows + hs]}
 
 
