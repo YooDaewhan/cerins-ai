@@ -108,7 +108,8 @@ RULES = """판단 규칙:
 - 등급 분류표가 발췌에 있으면 해당 표 번호와 기준값을 대조해 등급을 산정하고, 온도·재질에 따른 등급 상향 규칙도 적용한다.
 - 작동 매체·용도에서 합리적으로 추정할 수 있는 값(예: 공정가스(수소·CO 함유) → 가연성 → 1그룹)은 **가정:**으로 밝히고 판단을 진행한다.
   '판단불가'는 결론을 가르는 핵심 정보가 정말 없을 때만 쓰고, 그때도 무엇이 확인되면 어떻게 되는지(조건부 결론)를 적는다.
-출력 형식: 마크다운. 큰 항목은 '## 제목', 비교·판단은 표(| 열 |), 핵심 결론은 **굵게**. 같은 말 반복 없이 간결하게."""
+출력 형식: 마크다운. 큰 항목은 '## 제목', 비교·판단은 표(| 열 |), 핵심 결론은 **굵게**. 같은 말 반복 없이 간결하게.
+표의 칸 안에는 '|' 문자를 쓰지 않는다(조항은 'TR CU 032/2013 Appendix No. 1 표 1'처럼 쓴다). 칸 안 줄바꿈은 <br>."""
 ANSWER_PROMPT = """너는 인증 규정 검토 보조자다. 아래 '규정 발췌'에 있는 내용만 근거로 한국어로 답하라.
 형식: ## 결론 (해당/비해당/판단불가, 등급·적합성 평가 방식이 나오면 함께) ## 근거 (조항과 비교한 값을 표로) ## 추가로 필요한 정보
 """ + RULES + """
@@ -269,8 +270,10 @@ def ask(body: Ask):
             rows += got + [x for x in hs_mentions(heads, f, k=4) if x not in got]
         if p.pressure.value is not None or (body.drawing and "압력" in body.drawing):
             rows += pressure_tables(body.family if one else None)
+    # 라벨 구분자는 '·' (예전 '|'를 AI가 답변 표 칸에 그대로 옮겨 써서 표가 깨졌음)
     fmt = lambda xs: "\n---\n".join(
-        f"[{x['code']} | {x['article']}{' | p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}" for x in xs)
+        f"[{x['code']} · {(x['article'] or '').splitlines()[0].strip() if x['article'] else ''}"
+        f"{' · p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}" for x in xs)
     prompt = HS_ANSWER_PROMPT if body.family == "HS" else ANSWER_PROMPT if one else ALL_PROMPT
     out = generate(
         model=ANSWER_MODEL, contents=prompt.format(

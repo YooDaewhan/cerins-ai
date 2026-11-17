@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, jsonInit } from './api'
+import Md from './Md'
 
 type Source = { code: string; article: string | null; page: number | null }
 type Msg = { role: 'me' | 'ai'; text: string; sources?: Source[]; error?: boolean }
@@ -15,8 +16,25 @@ const EXAMPLE: Record<string, string> = {
   ALL: '📎 도면 PDF를 올리고 전송하면 HS 코드와 적용 규정을 한번에 검토합니다',
 }
 
+// 조항 라벨이 여러 줄("Appendix No. 2 \nto the Technical ...")로 저장된 경우가 있어 첫 줄만, 중복 제거
+const sourceLabels = (ss?: Source[]) =>
+  [...new Set((ss ?? []).map((s) =>
+    [s.code, (s.article ?? '').split('\n')[0].trim(), s.page ? `p.${s.page}` : ''].filter(Boolean).join(' · ')))]
+
+// 글자 크기 (보는 사람 브라우저에만 저장)
+const SIZES = [14, 16, 18, 20]
+function loadSize() {
+  try { return Number(localStorage.getItem('chat-font')) || 16 } catch { return 16 }
+}
+
 export default function Chat({ family }: { family: string }) {
   const [msgs, setMsgs] = useState<Msg[]>([])
+  const [font, setFont] = useState(loadSize)
+  const zoom = (d: number) => {
+    const next = SIZES[Math.min(SIZES.length - 1, Math.max(0, SIZES.indexOf(font) + d))] ?? 16
+    setFont(next)
+    try { localStorage.setItem('chat-font', String(next)) } catch { /* 저장 불가(사생활 보호 모드 등) */ }
+  }
   const [q, setQ] = useState('')
   const [busy, setBusy] = useState(false)
   const [drawing, setDrawing] = useState<{ name: string; text: string } | null>(null) // 첨부한 도면 사양
@@ -62,28 +80,29 @@ export default function Chat({ family }: { family: string }) {
 
   return (
     <>
-      <div className="msgs">
+      <div className="msgs" style={{ fontSize: font }}>
         {msgs.length === 0 && (
           <div className="empty">
             <h2>{family === 'ALL' ? '통합 검토' : `${family} 질문하기`}</h2>
             <p>{EXAMPLE[family] ?? '예: "규격 15cm, 압력 14인데 적용 대상인가요?"'}</p>
           </div>
         )}
-        {msgs.map((m, i) => (
-          <div key={i} className={m.role}>
-            <div className={`bubble ${m.error ? 'err' : ''}`}>{m.text}</div>
-            {m.sources && m.sources.length > 0 && (
-              <div className="meta">
-                근거:{' '}
-                {m.sources.map((s, j) => (
-                  <span className="chip" key={j}>
-                    {s.code} {s.article ?? ''} {s.page ? `p.${s.page}` : ''}
-                  </span>
-                ))}
+        {msgs.map((m, i) => {
+          const src = sourceLabels(m.sources)
+          return (
+            <div key={i} className={m.role}>
+              <div className={`bubble ${m.error ? 'err' : ''}`}>
+                {m.role === 'ai' && !m.error ? <Md text={m.text} /> : m.text}
               </div>
-            )}
-          </div>
-        ))}
+              {src.length > 0 && (
+                <details className="meta">
+                  <summary>근거 {src.length}건</summary>
+                  {src.map((s) => <span className="chip" key={s}>{s}</span>)}
+                </details>
+              )}
+            </div>
+          )
+        })}
         {busy && (
           <div className="ai">
             <div className="bubble">검토 중…</div>
@@ -109,6 +128,10 @@ export default function Chat({ family }: { family: string }) {
             send()
           }}
         >
+          <div className="zoom">
+            <button type="button" onClick={() => zoom(1)} disabled={font === SIZES.at(-1)} title="답변 글자 크게">가+</button>
+            <button type="button" onClick={() => zoom(-1)} disabled={font === SIZES[0]} title="답변 글자 작게">가−</button>
+          </div>
           <label className="btn" style={{ background: 'var(--panel)', color: 'inherit', border: '1px solid var(--border)', alignSelf: 'stretch', display: 'flex', alignItems: 'center', cursor: busy ? 'default' : 'pointer' }}>
             📎 도면
             <input type="file" accept=".pdf" hidden disabled={busy}
