@@ -45,13 +45,19 @@ def gem():
 
 
 def generate(model, contents, config=None):
-    """Gemini 호출. 서버 과부하(503)·한도(429)는 잠시 후 3회까지 재시도, 계속 실패하면 예외(안내 문구로 변환됨)."""
+    """Gemini 호출. 서버 과부하(503)·한도(429)는 잠시 후 재시도하고, 그래도 안 되면 PARSE_MODEL(가벼운 모델)로 대신 호출.
+    flash 계열이 수십 분씩 503을 내는 동안 lite는 정상인 경우가 많음. 둘 다 실패하면 예외(안내 문구로 변환됨)."""
     for attempt in range(3):
         try:
             return gem().models.generate_content(model=model, contents=contents, config=config)
         except errors.APIError as e:
-            if e.code not in (429, 503) or attempt == 2:
+            if e.code not in (429, 503):
                 raise
+            if attempt == 2:
+                if model == PARSE_MODEL:
+                    raise
+                print(f"[gemini] {model} 혼잡 → {PARSE_MODEL}로 대체", flush=True)
+                return generate(PARSE_MODEL, contents, config)
             time.sleep(2 * (attempt + 1))
 
 
