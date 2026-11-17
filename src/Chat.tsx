@@ -20,7 +20,9 @@ export default function Chat({ family }: { family: string }) {
 
   async function send() {
     // 도면만 선택하고 질문을 비워 두면 기본 질문으로 검토
-    const question = q.trim() || (pending ? '첨부한 도면이 이 규정의 적용 대상인지 검토해 주세요.' : '')
+    const question = q.trim() || (pending
+      ? family === 'HS' ? '첨부한 도면의 품목에 맞는 HS 코드를 찾아 주세요.' : '첨부한 도면이 이 규정의 적용 대상인지 검토해 주세요.'
+      : '')
     if (!question || busy) return
     const file = pending
     setQ('')

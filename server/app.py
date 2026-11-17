@@ -106,6 +106,7 @@ HS 참고(한국 HSK 코드표에서 질문 품목과 가까운 호. 규정 표�
 {hs}"""
 HS_ANSWER_PROMPT = """너는 HS 품목분류 보조자다. 아래 'HS 코드표 발췌'(관세청 HSK 10단위·한글 품명, 상위는 영문)만 근거로 한국어로 답하라.
 형식: 1) 후보 HS 코드(10단위, 가능성 높은 순, 각 코드의 품명) 2) 근거(어느 호·소호의 어떤 문구에 해당하는지) 3) 확정에 필요한 추가 정보(재질·용도·작동 방식 등).
+도면 사양이 있으면 재질·작동 방식·용도·크기를 하위 코드의 구분 기준(예: 전기 작동식/액압 작동식, 스테인리스/주철)과 하나씩 대조해 어느 코드인지 고르고, 도면에 없어 고를 수 없는 기준은 무엇인지 적어라.
 발췌에 없는 코드는 만들지 마라. 품목분류는 관세율표 해석 통칙과 부·류 주(註)로 최종 결정되므로, 애매하면 단정하지 말고 관세청 사전심사를 권하라.
 
 이전 대화:
@@ -139,19 +140,22 @@ class Spec(BaseModel):
     design_temperature: Qty
     working_medium: Optional[str] = None
     material: Optional[str] = None
+    # HS 분류에 쓰는 정보: 품명·기능·작동 방식(수동/전기/유압/공압 등)·용도·구조. 도면에 적힌 것만
+    product: Optional[str] = None
     notes: Optional[str] = None   # 읽기 어렵거나 불확실한 부분
 
 
 DRAWING_PROMPT = ("첨부한 기술 도면(PDF)에서 장비 사양을 읽어 JSON으로 답하라. 도면에 없거나 읽을 수 없는 값은 반드시 null로 두고 "
                   "절대 추정하지 않는다. 숫자와 단위는 도면에 적힌 그대로 쓴다(단위를 바꾸거나 환산하지 않는다). "
-                  "글자가 작거나 흐려서 확신이 없는 값은 notes에 적는다.")
+                  "글자가 작거나 흐려서 확신이 없는 값은 notes에 적는다. "
+                  "product에는 품명과 기능, 작동 방식(수동·전기·유압·공압 등), 용도, 주요 구조를 도면·표제란·부품표에 적힌 대로 요약한다.")
 
 
 def spec_text(s: Spec) -> str:
     q = lambda x: None if x.value is None else f"{x.value:g} {x.unit or '(단위 불명)'}"
     rows = [("장비", s.equipment_type), ("설계압력", q(s.design_pressure)), ("작동압력", q(s.working_pressure)),
             ("용량", q(s.capacity)), ("호칭지름", q(s.nominal_diameter)), ("설계온도", q(s.design_temperature)),
-            ("작동 매체", s.working_medium), ("재질", s.material), ("메모", s.notes)]
+            ("작동 매체", s.working_medium), ("재질", s.material), ("품목·기능", s.product), ("메모", s.notes)]
     return "\n".join(f"{k}: {v}" for k, v in rows if v)
 
 
