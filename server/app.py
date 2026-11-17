@@ -12,7 +12,7 @@ from psycopg.rows import dict_row
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
-from ingest import DATA, detect, ingest_file
+from ingest import DATA, HS_TABLE, detect, hs_upload, ingest_file
 
 load_dotenv()
 PARSE_MODEL = os.getenv("PARSE_MODEL")    # .env에서 지정 (모델 이름은 직접 조회해서 정함)
@@ -61,6 +61,13 @@ def connect():
     return c
 
 
+try:  # HS 검색 탭이 적재 전에도 빈 결과로 동작하도록 테이블만 미리 생성
+    with connect() as _c:
+        _c.execute(HS_TABLE)
+except Exception as e:
+    print(f"[hs] 테이블 생성 실패: {e!r}", flush=True)
+
+
 # ---------- 질문 ----------
 class Qty(BaseModel):
     value: Optional[float] = None
@@ -91,6 +98,17 @@ ANSWER_PROMPT = """너는 인증 규정 검토 보조자다. 아래 '규정 발�
 질문: {q}
 추출된 조건: {p}
 규정 발췌:
+{ctx}"""
+HS_ANSWER_PROMPT = """너는 HS 품목분류 보조자다. 아래 'HS 코드표 발췌'(관세청 HSK 10단위·한글 품명, 상위는 영문)만 근거로 한국어로 답하라.
+형식: 1) 후보 HS 코드(10단위, 가능성 높은 순, 각 코드의 품명) 2) 근거(어느 호·소호의 어떤 문구에 해당하는지) 3) 확정에 필요한 추가 정보(재질·용도·작동 방식 등).
+발췌에 없는 코드는 만들지 마라. 품목분류는 관세율표 해석 통칙과 부·류 주(註)로 최종 결정되므로, 애매하면 단정하지 말고 관세청 사전심사를 권하라.
+
+이전 대화:
+{hist}
+{drw}
+질문: {q}
+추출된 조건: {p}
+HS 코드표 발췌:
 {ctx}"""
 
 
@@ -186,7 +204,7 @@ def ask(body: Ask):
     ctx = "\n---\n".join(f"[{x['code']} | {x['article']}{' | p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}"
                          for x in rows) or "(검색 결과 없음)"
     out = generate(
-        model=ANSWER_MODEL, contents=ANSWER_PROMPT.format(q=body.question, p=p.model_dump_json(), ctx=ctx, hist=hist, drw=drw),
+        model=ANSWER_MODEL, contents=(HS_ANSWER_PROMPT if body.family == "HS" else ANSWER_PROMPT).format(q=body.question, p=p.model_dump_json(), ctx=ctx, hist=hist, drw=drw),
         config=types.GenerateContentConfig(max_output_tokens=4096))  # 생각 토큰 포함 한도라 넉넉히
     return {"parsed": p, "answer": out.text,
             "sources": [{"code": x["code"], "article": x["article"], "page": x["page"]} for x in rows]}
@@ -208,12 +226,17 @@ def upload_regulation(family: str = Form(), batch: str = Form(), file: UploadFil
     # 동기 함수라 FastAPI가 스레드풀에서 실행 → 임베딩 중에도 다른 요청은 처리됨
     name = os.path.basename(file.filename or "file")
     suffix = os.path.splitext(name)[1].lower()
-    if suffix not in (".pdf", ".docx", ".txt"):
-        raise HTTPException(400, "pdf, docx, txt 파일만 올릴 수 있습니다")
+    hs = family == "HS" and suffix in (".xlsx", ".json")  # 관세청 HS부호 엑셀 / Comtrade 참조표
+    if suffix not in (".pdf", ".docx", ".txt") and not hs:
+        raise HTTPException(400, "pdf, docx, txt 파일만 올릴 수 있습니다" + (" (HS: xlsx, json도 가능)" if family == "HS" else ""))
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as t:
         t.write(file.file.read())
     code_ = code
     try:
+        if hs:
+            msg, n = hs_upload(emb, t.name, name, family)
+            log_ingest(batch, family, "HSK", name, version, n, "ok", msg, t.name)
+            return {"message": msg, "code": "HSK"}
         dcode, dlang = detect(t.name, name, family)
         code_, lang = (code or dcode).strip(), lang or dlang
         n = ingest_file(emb, t.name, family, code_, lang, version)
@@ -306,3 +329,60 @@ def delete_glossary(gid: int):
     with connect() as c:
         c.execute("DELETE FROM glossary WHERE id=%s", (gid,))
     return {"ok": True}
+
+
+# ---------- HS 코드 검색 ----------
+# 1.9만 행이라 인덱스 없이 훑어도 수 ms. 의미 검색은 질문하기와 같은 호(4단위) 조각 임베딩을 재사용.
+HS_COLS = ("h.code, h.name_ko, h.name_en, EXISTS (SELECT 1 FROM hs_codes k WHERE k.parent=h.code) AS has_children, "
+           "(SELECT coalesce(nullif(x.name_ko, ''), x.name_en) FROM hs_codes x WHERE x.code=left(h.code, 4)) AS heading")
+
+
+@app.get("/api/hs/children")
+def hs_children(parent: Optional[str] = None):
+    """parent 비우면 류(2단위) 목록."""
+    with connect() as c:
+        return c.execute(f"SELECT {HS_COLS} FROM hs_codes h WHERE h.parent IS NOT DISTINCT FROM %s::text ORDER BY h.code",
+                         (parent or None,)).fetchall()
+
+
+@app.get("/api/hs/search")
+def hs_search(q: str):
+    """숫자면 코드 앞자리 검색. 글자면 품명(한·영) 포함 검색 + 용어사전 연결어 + 의미가 가까운 호(4단위)."""
+    q = q.strip()
+    digits = re.sub(r"[\s.\-]", "", q)
+    with connect() as c:
+        if digits.isdigit():
+            return {"codes": c.execute(f"SELECT {HS_COLS} FROM hs_codes h WHERE h.code LIKE %s ORDER BY h.code LIMIT 300",
+                                       (digits + "%",)).fetchall(), "headings": []}
+        if len(q) < 2:
+            return {"codes": [], "headings": []}
+        words = [f"%{w}%" for w in q.split()]
+        alias = [f"%{a}%" for a in glossary_terms(q, "HS")]
+        codes = c.execute(
+            f"SELECT {HS_COLS} FROM hs_codes h, LATERAL (SELECT concat_ws(' ', h.name_ko, h.name_en) AS t) n "
+            "WHERE n.t ILIKE ALL(%s) OR n.t ILIKE ANY(%s::text[]) ORDER BY h.code LIMIT 300", (words, alias)).fetchall()
+        c.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+        heads = [r["article"] for r in c.execute(
+            "SELECT c.article FROM chunks c JOIN documents d ON d.id=c.document_id "
+            "WHERE d.family='HS' AND d.code='HSK' AND d.status='active' ORDER BY c.embedding <=> %s LIMIT 8",
+            (emb.encode(q, normalize_embeddings=True),)).fetchall()]
+        rows = {r["code"]: r for r in c.execute(f"SELECT {HS_COLS} FROM hs_codes h WHERE h.code = ANY(%s::text[])", (heads,)).fetchall()}
+    return {"codes": codes, "headings": [rows[h] for h in heads if h in rows]}
+
+
+@app.get("/api/hs/code/{code}")
+def hs_detail(code: str):
+    """상위 경로 + 하위 코드 + 이 호(4단위)를 언급하는 규정 조항(TR CU 등, ТН ВЭД 코드 표기)."""
+    if not code.isdigit():
+        raise HTTPException(400, "숫자 코드만 가능합니다")
+    with connect() as c:
+        path = c.execute(f"SELECT {HS_COLS} FROM hs_codes h WHERE %s::text LIKE h.code || '%%' ORDER BY length(h.code)", (code,)).fetchall()
+        if not path or path[-1]["code"] != code:
+            raise HTTPException(404, "없는 코드입니다")
+        kids = c.execute(f"SELECT {HS_COLS} FROM hs_codes h WHERE h.parent=%s ORDER BY h.code", (code,)).fetchall()
+        mentions = [] if len(code) < 4 else c.execute(
+            "SELECT d.code, c.article, c.page, substr(c.content, greatest(1, strpos(c.content, %s) - 100), 300) AS snippet "
+            "FROM chunks c JOIN documents d ON d.id=c.document_id "
+            "WHERE d.family <> 'HS' AND d.status='active' AND c.content ~ %s ORDER BY d.code, c.id LIMIT 30",
+            (code[:4], rf"(?<!\d){code[:4]}(?!\d)")).fetchall()
+    return {"path": path, "children": kids, "mentions": mentions}

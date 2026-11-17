@@ -1,7 +1,7 @@
 """CLI: python ingest.py 파일.pdf|.docx|.txt --family "TR CU" --code "TR CU 032/2013" --lang en [--version 2024-03]
 같은 파일(해시 동일)은 무시. 새 파일이면 active→previous, 기존 previous는 삭제(최대 2개 보존).
 API(app.py)도 ingest_file()을 그대로 사용."""
-import argparse, hashlib, os, re
+import argparse, hashlib, json, os, re, shutil
 from collections import Counter
 import psycopg
 from dotenv import load_dotenv
@@ -114,23 +114,112 @@ def ingest_file(model, path, family, code, lang=None, version=None, url=None):
     items = list(chunks(blocks(path)))
     if not items:
         raise ValueError("텍스트를 추출하지 못했습니다 (스캔본이면 OCR 필요)")
-
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:  # 블록 종료 시 commit, 예외면 rollback
         register_vector(conn)
-        if conn.execute("SELECT 1 FROM documents WHERE code=%s AND file_hash=%s", (code, h)).fetchone():
-            raise ValueError("이미 적재된 파일입니다 (변경 없음)")
-        vecs = model.encode([t for _, _, t in items], batch_size=16, normalize_embeddings=True)
-        conn.execute("DELETE FROM documents WHERE code=%s AND status='previous'", (code,))
-        conn.execute("UPDATE documents SET status='previous' WHERE code=%s AND status='active'", (code,))
-        doc_id = conn.execute(
-            "INSERT INTO documents (family,code,language,version_label,source_url,file_hash)"
-            " VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
-            (family, code, lang, version, url, h)).fetchone()[0]
-        with conn.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO chunks (document_id,article,page,content,embedding) VALUES (%s,%s,%s,%s,%s)",
-                [(doc_id, art, pg, t, v) for (art, pg, t), v in zip(items, vecs)])
+        return store_chunks(conn, model, items, h, family, code, lang, version, url)
+
+
+def store_chunks(conn, model, items, h, family, code, lang, version, url):
+    """items=(article, page, text) 목록을 문서 1건으로 저장. 같은 코드는 현재·직전 버전만 유지."""
+    if conn.execute("SELECT 1 FROM documents WHERE code=%s AND file_hash=%s", (code, h)).fetchone():
+        raise ValueError("이미 적재된 파일입니다 (변경 없음)")
+    vecs = model.encode([t for _, _, t in items], batch_size=16, normalize_embeddings=True)
+    conn.execute("DELETE FROM documents WHERE code=%s AND status='previous'", (code,))
+    conn.execute("UPDATE documents SET status='previous' WHERE code=%s AND status='active'", (code,))
+    doc_id = conn.execute(
+        "INSERT INTO documents (family,code,language,version_label,source_url,file_hash)"
+        " VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+        (family, code, lang, version, url, h)).fetchone()[0]
+    with conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO chunks (document_id,article,page,content,embedding) VALUES (%s,%s,%s,%s,%s)",
+            [(doc_id, art, pg, t, v) for (art, pg, t), v in zip(items, vecs)])
     return len(items)  # 원본 파일 보관은 호출 측(app.py의 업로드 기록)에서 처리
+
+
+# ---------- HS 코드 ----------
+# 관세청 HS부호 엑셀(10단위 한글·영문 품명) + UN Comtrade 참조표 JSON(류·호·소호 2/4/6단위 영문 이름)을 합쳐 한 트리로 만든다.
+# 두 파일은 data/hs/에 보관하고, 둘 다 있으면 다시 적재한다(어느 쪽을 새로 올려도 됨).
+HS_DIR = os.path.join(DATA, "hs")
+HS_FILES = {".json": "comtrade.json", ".xlsx": "hsk.xlsx"}
+HS_TABLE = """CREATE TABLE IF NOT EXISTS hs_codes (
+    code text PRIMARY KEY, parent text, name_ko text, name_en text);
+CREATE INDEX IF NOT EXISTS hs_codes_parent ON hs_codes (parent)"""
+
+
+def hsk_rows(path):
+    """관세청 엑셀 → {code: (한글, 영문)}. A열 HS부호(7~10자리, 7~9자리는 중간 묶음), D 한글품목명, E 영문품목명."""
+    from openpyxl import load_workbook
+    ws = load_workbook(path, read_only=True).active
+    out = {}
+    for r in ws.iter_rows(min_row=2, max_col=5, values_only=True):
+        code = str(r[0] or "").strip()
+        if code.isdigit() and len(code) >= 7:
+            out[code] = ((r[3] or "").strip(), (r[4] or "").strip())
+    return out
+
+
+def comtrade_names(path):
+    """Comtrade 참조표 → {code: 영문}. 2·4·6단위만. 파일이 배열이든 {"results": [...]}든 받음."""
+    d = json.load(open(path, encoding="utf-8-sig"))
+    out = {}
+    for x in d["results"] if isinstance(d, dict) else d:
+        code = str(x.get("id", ""))
+        if code.isdigit() and len(code) in (2, 4, 6):
+            out[code] = x["text"].split(" - ", 1)[-1].lstrip("- ").strip()  # "848110 - -  Valves..." → "Valves..."
+    return out
+
+
+def hs_tree(hsk, names):
+    """[(code, parent, ko, en)]. 부모 = 목록에 있는 가장 긴 앞자리 코드.
+    Comtrade는 여러 HS 버전이 섞여 있으므로 관세청 코드의 앞자리인 것(현행)만 쓴다."""
+    live = {c[:n] for c in hsk for n in (2, 4, 6)}
+    nodes = {c: (None, en) for c, en in names.items() if c in live} | hsk
+    rows = []
+    for c in sorted(nodes):
+        parent = next((c[:n] for n in range(len(c) - 1, 1, -1) if c[:n] in nodes), None)
+        rows.append((c, parent, *nodes[c]))
+    return rows
+
+
+def hs_upload(model, path, filename, family):
+    """업로드 파일을 보관하고, 엑셀·JSON이 둘 다 있으면 적재. (메시지, 조각 수) 반환."""
+    suffix = os.path.splitext(filename)[1].lower()
+    # 형식부터 확인해 엉뚱한 파일이 보관본을 덮어쓰지 않게 함
+    n = len(hsk_rows(path)) if suffix == ".xlsx" else len(comtrade_names(path))
+    if not n:
+        raise ValueError("HS 코드를 찾지 못했습니다 (관세청 HS부호 엑셀 또는 Comtrade 참조표 JSON인지 확인)")
+    os.makedirs(HS_DIR, exist_ok=True)
+    shutil.copy(path, os.path.join(HS_DIR, HS_FILES[suffix]))
+    if suffix == ".xlsx":
+        with open(os.path.join(HS_DIR, "hsk.name"), "w", encoding="utf-8") as f:
+            f.write(filename)
+    xlsx, js = (os.path.join(HS_DIR, HS_FILES[s]) for s in (".xlsx", ".json"))
+    if not (os.path.exists(xlsx) and os.path.exists(js)):
+        return f"{n}개 코드 저장 — 나머지 파일(관세청 엑셀 / Comtrade JSON)도 올리면 적재됩니다", 0
+    rows = hs_tree(hsk_rows(xlsx), comtrade_names(js))
+    by = {c: (ko, en) for c, _, ko, en in rows}
+    label = lambda c: f"{c} {' / '.join(x for x in by[c] if x)}"
+    kids = {}
+    for c, p, *_ in rows:
+        kids.setdefault(p, []).append(c)
+
+    def lines(c, depth):
+        return [("  " * depth) + label(c)] + [x for k in kids.get(c, []) for x in lines(k, depth + 1)]
+
+    # 질문하기용 조각: 호(4단위)마다 류 이름 + 하위 코드 전체 (호 하나가 분류 판단의 기본 단위)
+    items = [(c, None, f"[HS {c}] 류 {label(p)}\n" + "\n".join(lines(c, 0)))
+             for c, p, *_ in rows if len(c) == 4 and p]
+    ver = (re.findall(r"\d{8}", open(os.path.join(HS_DIR, "hsk.name"), encoding="utf-8").read()) or [None])[0]
+    h = hashlib.sha256(open(xlsx, "rb").read() + open(js, "rb").read()).hexdigest()
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        register_vector(conn)
+        conn.execute(HS_TABLE)
+        n = store_chunks(conn, model, items, h, family, "HSK", "ko", ver, None)
+        conn.execute("DELETE FROM hs_codes")
+        with conn.cursor() as cur:
+            cur.executemany("INSERT INTO hs_codes (code, parent, name_ko, name_en) VALUES (%s,%s,%s,%s)", rows)
+    return f"HS 코드 {len(rows)}개, 호 {n}개 조각 적재", n
 
 
 if __name__ == "__main__":

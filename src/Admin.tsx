@@ -99,8 +99,14 @@ export function Regulations({ family }: { family: string }) {
     <div className="page">
       <h2>규정 업데이트</h2>
       <p>파일을 선택해 올리면 자동으로 임베딩됩니다. 선택한 파일은 한 번의 업데이트로 기록되고 원본도 보관됩니다. 같은 규정은 현재와 직전 버전만 유지됩니다.</p>
+      {family === 'HS' && (
+        <p className="meta">
+          HS 코드표: <b>관세청 HS부호 엑셀(.xlsx)</b>과 <b>UN Comtrade 참조표(.json, 류·호 이름)</b>을 함께 올리면 검색·질문하기에 반영됩니다.
+          해마다 관세청 엑셀만 새로 올려도 됩니다. 해설서·류 주(註) PDF도 올릴 수 있습니다.
+        </p>
+      )}
       <form className="form" onSubmit={upload}>
-        <input name="file" type="file" accept=".pdf,.docx,.txt" multiple required />
+        <input name="file" type="file" accept={family === 'HS' ? '.pdf,.docx,.txt,.xlsx,.json' : '.pdf,.docx,.txt'} multiple required />
         <button className="btn" disabled={busy}>
           {busy ? '업로드 중…' : '업로드'}
         </button>

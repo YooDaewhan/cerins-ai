@@ -41,3 +41,9 @@ table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); }
 .link { border: 0; background: none; color: var(--accent); }
 @media (max-width: 700px) { .side { width: 150px; } .me .bubble { margin-left: 0; } }
+
+.search { width: 100%; padding: 12px 14px; font-size: 1.05em; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); margin-bottom: 12px; box-sizing: border-box; }
+.crumbs { margin: 8px 0; }
+.click { cursor: pointer; }
+tr.click:hover { background: var(--accent-bg); }
+button.chip { background: none; color: inherit; }

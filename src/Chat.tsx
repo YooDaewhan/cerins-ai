@@ -54,7 +54,7 @@ export default function Chat({ family }: { family: string }) {
         {msgs.length === 0 && (
           <div className="empty">
             <h2>{family} 질문하기</h2>
-            <p>예: "규격 15cm, 압력 14인데 적용 대상인가요?"</p>
+            <p>{family === 'HS' ? '예: "스테인리스 수동 볼밸브 HS코드가 뭔가요?"' : '예: "규격 15cm, 압력 14인데 적용 대상인가요?"'}</p>
           </div>
         )}
         {msgs.map((m, i) => (
