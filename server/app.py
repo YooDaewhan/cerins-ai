@@ -75,6 +75,12 @@ def generate(model, contents, config=None, fallback=None):
         try:
             return gem().models.generate_content(model=model, contents=contents, config=config)
         except errors.APIError as e:
+            if e.code == 404:  # 목록에는 있지만 이 키로는 못 쓰는 모델 → 목록에서 빼고 다른 모델 고르게 함
+                if model in _models[1]:
+                    _models[1].remove(model)
+                if fallback and fallback != model:
+                    return generate(fallback, contents, config)
+                raise HTTPException(503, f"{model} 모델은 이 키로 사용할 수 없어 목록에서 뺐습니다.")
             if e.code not in (429, 503):
                 raise
             print(f"[gemini] {model} → {e.code} (시도 {attempt + 1})", flush=True)

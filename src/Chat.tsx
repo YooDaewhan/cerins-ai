@@ -93,6 +93,7 @@ export default function Chat({ family }: { family: string }) {
     } catch (e) {
       // 503 = 모델 혼잡 → 다른 모델로 다시 보낼지 물음
       const crowded = (e as { status?: number }).status === 503 && !!list
+      if (crowded) api<Models>('/api/models').then(setList).catch(() => {}) // 못 쓰는 모델이 빠진 목록으로 갱신
       setMsgs((m) => [...m, {
         role: 'ai', text: `오류: ${(e as Error).message}`, error: true, model: use,
         retry: crowded ? { question, file: analyzed ? null : file } : undefined,
@@ -122,7 +123,9 @@ export default function Chat({ family }: { family: string }) {
               {m.retry && last && list && (
                 <div className="retry">
                   다른 모델로 다시 보낼까요?{' '}
-                  {list.models.filter((x) => x !== m.model).slice(0, 4).map((x) => (
+                  {/* 혼잡할 때도 대체로 응답하는 lite 모델을 먼저 */}
+                  {[...list.models].sort((a, b) => Number(b.includes('lite')) - Number(a.includes('lite')))
+                    .filter((x) => x !== m.model).slice(0, 4).map((x) => (
                     <button key={x} className="chip click" disabled={busy}
                       onClick={() => { choose(x); send(m.retry, x) }}>{x}</button>
                   ))}
