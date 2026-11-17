@@ -5,6 +5,16 @@ type Source = { code: string; article: string | null; page: number | null }
 type Msg = { role: 'me' | 'ai'; text: string; sources?: Source[]; error?: boolean }
 type Ask = { answer: string; sources: Source[] }
 
+// 도면만 첨부하고 질문을 비웠을 때 보낼 기본 질문, 빈 화면 예시
+const DEFAULT_Q: Record<string, string> = {
+  HS: '첨부한 도면의 품목에 맞는 HS 코드를 찾아 주세요.',
+  ALL: '첨부한 도면 품목의 HS 코드와, 등록된 규정 각각에 해당하는지 검토해 주세요.',
+}
+const EXAMPLE: Record<string, string> = {
+  HS: '예: "스테인리스 수동 볼밸브 HS코드가 뭔가요?"',
+  ALL: '📎 도면 PDF를 올리고 전송하면 HS 코드와 적용 규정을 한번에 검토합니다',
+}
+
 export default function Chat({ family }: { family: string }) {
   const [msgs, setMsgs] = useState<Msg[]>([])
   const [q, setQ] = useState('')
@@ -21,7 +31,7 @@ export default function Chat({ family }: { family: string }) {
   async function send() {
     // 도면만 선택하고 질문을 비워 두면 기본 질문으로 검토
     const question = q.trim() || (pending
-      ? family === 'HS' ? '첨부한 도면의 품목에 맞는 HS 코드를 찾아 주세요.' : '첨부한 도면이 이 규정의 적용 대상인지 검토해 주세요.'
+      ? DEFAULT_Q[family] ?? '첨부한 도면이 이 규정의 적용 대상인지 검토해 주세요.'
       : '')
     if (!question || busy) return
     const file = pending
@@ -55,8 +65,8 @@ export default function Chat({ family }: { family: string }) {
       <div className="msgs">
         {msgs.length === 0 && (
           <div className="empty">
-            <h2>{family} 질문하기</h2>
-            <p>{family === 'HS' ? '예: "스테인리스 수동 볼밸브 HS코드가 뭔가요?"' : '예: "규격 15cm, 압력 14인데 적용 대상인가요?"'}</p>
+            <h2>{family === 'ALL' ? '통합 검토' : `${family} 질문하기`}</h2>
+            <p>{EXAMPLE[family] ?? '예: "규격 15cm, 압력 14인데 적용 대상인가요?"'}</p>
           </div>
         )}
         {msgs.map((m, i) => (

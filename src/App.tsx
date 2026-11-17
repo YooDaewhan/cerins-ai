@@ -4,6 +4,7 @@ import './App.css'
 
 // 규정 카드. ready=false면 준비중. 새 규정을 열 때 ready를 true로 바꾸고 family를 지정.
 const CARDS = [
+  { family: 'ALL', title: '통합 검토', desc: 'PDF 하나로 HS 코드·적용 규정 한번에', ready: true },
   { family: 'TR CU', title: 'TR CU', desc: '관세동맹 기술규정', ready: true },
   { family: 'HS', title: 'HS 코드', desc: '품목분류 검색 (관세청 HSK)', ready: true },
   { family: '', title: '준비중', desc: 'GOST', ready: false },

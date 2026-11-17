@@ -104,6 +104,24 @@ ANSWER_PROMPT = """너는 인증 규정 검토 보조자다. 아래 '규정 발�
 HS 참고(한국 HSK 코드표에서 질문 품목과 가까운 호. 규정 표의 ТН ВЭД 코드와는 앞 6자리까지만 같으니 6자리까지만 비교하라.
 적용 대상 여부는 규정 발췌로만 판단하고, 이 참고는 품목이 어느 코드에 해당하는지 짚을 때만 쓴다):
 {hs}"""
+ALL_PROMPT = """너는 인증·통관 검토 보조자다. 아래 'HS 참고'와 '규정 발췌'에 있는 내용만 근거로 한국어로 답하라.
+형식:
+1) 품목 요약 (질문·도면 사양에서 품명, 기능, 재질, 압력·크기 등)
+2) HS 코드 후보 (관세청 HSK 10단위, 가능성 높은 순, 근거가 된 호·소호 문구). 사용자가 코드를 지정했으면 그 코드를 따른다.
+3) 규정별 검토 표: | 규정 | 판단(해당/비해당/판단불가) | 근거 조항 | 추가로 필요한 정보 |
+   규정 발췌에 나온 규정만 표에 넣는다. 규정 표의 ТН ВЭД 코드는 HSK와 앞 6자리까지만 같으니 6자리까지만 비교한다.
+   수치 비교는 비교한 두 값을 명시하고, 단위가 없거나 발췌로 판단할 수 없으면 추측하지 말고 판단불가로 두고 필요한 정보를 적는다.
+
+이전 대화:
+{hist}
+{drw}
+질문: {q}
+추출된 조건: {p}
+HS 참고:
+{hs}
+
+규정 발췌:
+{ctx}"""
 HS_ANSWER_PROMPT = """너는 HS 품목분류 보조자다. 아래 'HS 코드표 발췌'(관세청 HSK 10단위·한글 품명, 상위는 영문)만 근거로 한국어로 답하라.
 형식: 1) 후보 HS 코드(10단위, 가능성 높은 순, 각 코드의 품명) 2) 근거(어느 호·소호의 어떤 문구에 해당하는지) 3) 확정에 필요한 추가 정보(재질·용도·작동 방식 등).
 도면 사양이 있으면 재질·작동 방식·용도·크기를 하위 코드의 구분 기준(예: 전기 작동식/액압 작동식, 스테인리스/주철)과 하나씩 대조해 어느 코드인지 고르고, 도면에 없어 고를 수 없는 기준은 무엇인지 적어라.
@@ -209,19 +227,39 @@ def ask(body: Ask):
         model=PARSE_MODEL, contents=f"{PARSE_PROMPT}\n이전 대화:\n{hist}\n{drw}\n질문: {body.question}",
         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Parsed))
     p: Parsed = r.parsed
-    rows = search(p, body.family, glossary_terms(body.question, body.family))
+    one = body.family not in (None, "ALL")  # ALL: 통합 검토 (HS 코드 + 등록된 모든 규정)
+    gl = glossary_terms(body.question, body.family if one else None)
     hs = []
-    if body.family != "HS":  # 규정 질문에도 품목과 가까운 HS 호를 참고로 붙이고, 그 호를 나열한 규정 조항(ТН ВЭД 표)도 찾아 넣음
-        hs = search(p.model_copy(update={"regulation": None}), "HS", glossary_terms(body.question, "HS"), k=3)
-        rows += [x for x in hs_mentions({x["article"][:4] for x in hs}, body.family) if x not in rows]
+    if body.family == "HS":
+        rows = search(p, "HS", gl)
+    else:  # 품목과 가까운 HS 호를 참고로 붙이고, 그 호를 코드로 나열한 규정 조항(ТН ВЭД 표)도 찾아 넣음
+        hs = search(p.model_copy(update={"regulation": None}), "HS", glossary_terms(body.question, "HS"), k=3 if one else 5)
+        heads = {x["article"][:4] for x in hs} | codes_in(body.question + "\n" + hist)
+        rows = []
+        # 통합 검토는 규정마다 몇 개씩 따로 뽑음 (한꺼번에 뽑으면 조각 많은 규정이 결과를 독차지함)
+        for f in ([body.family] if one else active_families()):
+            got = search(p if one else p.model_copy(update={"regulation": None}), f, gl, k=10 if one else 4)
+            rows += got + [x for x in hs_mentions(heads, f, k=4 if one else 3) if x not in got]
     fmt = lambda xs: "\n---\n".join(
         f"[{x['code']} | {x['article']}{' | p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}" for x in xs)
+    prompt = HS_ANSWER_PROMPT if body.family == "HS" else ANSWER_PROMPT if one else ALL_PROMPT
     out = generate(
-        model=ANSWER_MODEL, contents=(HS_ANSWER_PROMPT if body.family == "HS" else ANSWER_PROMPT).format(
+        model=ANSWER_MODEL, contents=prompt.format(
             q=body.question, p=p.model_dump_json(), ctx=fmt(rows) or "(검색 결과 없음)", hs=fmt(hs) or "(없음)", hist=hist, drw=drw),
-        config=types.GenerateContentConfig(max_output_tokens=4096))  # 생각 토큰 포함 한도라 넉넉히
+        config=types.GenerateContentConfig(max_output_tokens=6144))  # 생각 토큰 포함 한도라 넉넉히
     return {"parsed": p, "answer": out.text,
             "sources": [{"code": x["code"], "article": x["article"], "page": x["page"]} for x in rows + hs]}
+
+
+def codes_in(text: str) -> set[str]:
+    """사용자가 적은 HS 코드(8481.80, 848180, 8481801010)의 호 4자리. 연도·치수 같은 4자리 숫자는 제외."""
+    return set(re.findall(r"(?<!\d)(\d{4})(?:\.\d{2}|\d{2,6})(?!\d)", text))
+
+
+def active_families() -> list[str]:
+    with connect() as c:
+        return [r["family"] for r in c.execute(
+            "SELECT DISTINCT family FROM documents WHERE status='active' AND family <> 'HS' ORDER BY family").fetchall()]
 
 
 def hs_mentions(heads: set[str], family: Optional[str], k=4):

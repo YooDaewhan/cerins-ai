@@ -8,17 +8,19 @@ const MENU = [
   ['regs', '규정 업데이트'],
   ['gloss', '용어 사전'],
 ] as const
+const TITLE: Record<string, string> = { ALL: '통합 검토' }
 export type Tab = (typeof MENU)[number][0]
 export const TABS = MENU.map(([k]) => k)
 
 type Props = { family: string; tab: Tab; onTab: (t: Tab) => void; onHome: () => void }
 
 export default function Workspace({ family, tab, onTab, onHome }: Props) {
-  const menu = MENU.filter(([k]) => k !== 'search' || family === 'HS')
+  // 통합 검토(ALL)는 질문만. 규정·용어는 각 규정 카드에서 관리
+  const menu = MENU.filter(([k]) => (family === 'ALL' ? k === 'chat' : k !== 'search' || family === 'HS'))
   return (
     <div className="ws">
       <nav className="side">
-        <h2>{family}</h2>
+        <h2>{TITLE[family] ?? family}</h2>
         {menu.map(([k, label]) => (
           <button key={k} className={tab === k ? 'cur' : ''} onClick={() => onTab(k)}>
             {label}
