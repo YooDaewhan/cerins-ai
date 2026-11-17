@@ -194,9 +194,18 @@ def hs_upload(model, path, filename, family):
     if suffix == ".xlsx":
         with open(os.path.join(HS_DIR, "hsk.name"), "w", encoding="utf-8") as f:
             f.write(filename)
-    xlsx, js = (os.path.join(HS_DIR, HS_FILES[s]) for s in (".xlsx", ".json"))
-    if not (os.path.exists(xlsx) and os.path.exists(js)):
+    if not all(os.path.exists(os.path.join(HS_DIR, f)) for f in HS_FILES.values()):
         return f"{n}개 코드 저장 — 나머지 파일(관세청 엑셀 / Comtrade JSON)도 올리면 적재됩니다", 0
+    return hs_rebuild(model, family)
+
+
+HS_MAX = 1500       # 조각 최대 글자 수. 하위 코드가 많은 호는 소호 단위로 나눠 임베딩 시간(긴 문장일수록 급증)을 줄임
+HS_CHUNKING = b"v2"  # 조각 나누는 방식이 바뀌면 올려서, 같은 파일이라도 다시 적재되게 함
+
+
+def hs_rebuild(model, family="HS"):
+    """data/hs/의 엑셀·JSON으로 hs_codes와 질문하기용 조각을 다시 만든다."""
+    xlsx, js = (os.path.join(HS_DIR, HS_FILES[s]) for s in (".xlsx", ".json"))
     rows = hs_tree(hsk_rows(xlsx), comtrade_names(js))
     by = {c: (ko, en) for c, _, ko, en in rows}
     label = lambda c: f"{c} {' / '.join(x for x in by[c] if x)}"
@@ -205,20 +214,33 @@ def hs_upload(model, path, filename, family):
         kids.setdefault(p, []).append(c)
 
     def lines(c, depth):
-        return [("  " * depth) + label(c)] + [x for k in kids.get(c, []) for x in lines(k, depth + 1)]
+        return [(c, ("  " * depth) + label(c))] + [x for k in kids.get(c, []) for x in lines(k, depth + 1)]
 
-    # 질문하기용 조각: 호(4단위)마다 류 이름 + 하위 코드 전체 (호 하나가 분류 판단의 기본 단위)
-    items = [(c, None, f"[HS {c}] 류 {label(p)}\n" + "\n".join(lines(c, 0)))
-             for c, p, *_ in rows if len(c) == 4 and p]
+    # 질문하기용 조각: 호(4단위)마다 류·호 이름 + 하위 코드. 길면 줄 단위로 나누고 article은 첫 소호(6단위)
+    items = []
+    for c, p, *_ in rows:
+        if len(c) != 4 or not p:
+            continue
+        head = f"[HS {c}] 류 {label(p)}\n{label(c)}"
+        pieces, cur = [], []
+        for code, text in lines(c, 0)[1:]:
+            if cur and sum(len(t) + 1 for _, t in cur) + len(text) > HS_MAX:
+                pieces.append(cur)
+                cur = []
+            cur.append((code, text))
+        pieces.append(cur)
+        for pc in pieces:
+            art = c if len(pieces) == 1 or not pc else pc[0][0][:6]
+            items.append((art, None, "\n".join([head, *(t for _, t in pc)])))
     ver = (re.findall(r"\d{8}", open(os.path.join(HS_DIR, "hsk.name"), encoding="utf-8").read()) or [None])[0]
-    h = hashlib.sha256(open(xlsx, "rb").read() + open(js, "rb").read()).hexdigest()
+    h = hashlib.sha256(open(xlsx, "rb").read() + open(js, "rb").read() + HS_CHUNKING).hexdigest()
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         register_vector(conn)
         n = store_chunks(conn, model, items, h, family, "HSK", "ko", ver, None)
         conn.execute("DELETE FROM hs_codes")
         with conn.cursor() as cur:
             cur.executemany("INSERT INTO hs_codes (code, parent, name_ko, name_en) VALUES (%s,%s,%s,%s)", rows)
-    return f"HS 코드 {len(rows)}개, 호 {n}개 조각 적재", n
+    return f"HS 코드 {len(rows)}개, {n}개 조각 적재", n
 
 
 if __name__ == "__main__":

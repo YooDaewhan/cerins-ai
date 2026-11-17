@@ -99,7 +99,11 @@ ANSWER_PROMPT = """너는 인증 규정 검토 보조자다. 아래 '규정 발�
 질문: {q}
 추출된 조건: {p}
 규정 발췌:
-{ctx}"""
+{ctx}
+
+HS 참고(한국 HSK 코드표에서 질문 품목과 가까운 호. 규정 표의 ТН ВЭД 코드와는 앞 6자리까지만 같으니 6자리까지만 비교하라.
+적용 대상 여부는 규정 발췌로만 판단하고, 이 참고는 품목이 어느 코드에 해당하는지 짚을 때만 쓴다):
+{hs}"""
 HS_ANSWER_PROMPT = """너는 HS 품목분류 보조자다. 아래 'HS 코드표 발췌'(관세청 HSK 10단위·한글 품명, 상위는 영문)만 근거로 한국어로 답하라.
 형식: 1) 후보 HS 코드(10단위, 가능성 높은 순, 각 코드의 품명) 2) 근거(어느 호·소호의 어떤 문구에 해당하는지) 3) 확정에 필요한 추가 정보(재질·용도·작동 방식 등).
 발췌에 없는 코드는 만들지 마라. 품목분류는 관세율표 해석 통칙과 부·류 주(註)로 최종 결정되므로, 애매하면 단정하지 말고 관세청 사전심사를 권하라.
@@ -202,13 +206,30 @@ def ask(body: Ask):
         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Parsed))
     p: Parsed = r.parsed
     rows = search(p, body.family, glossary_terms(body.question, body.family))
-    ctx = "\n---\n".join(f"[{x['code']} | {x['article']}{' | p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}"
-                         for x in rows) or "(검색 결과 없음)"
+    hs = []
+    if body.family != "HS":  # 규정 질문에도 품목과 가까운 HS 호를 참고로 붙이고, 그 호를 나열한 규정 조항(ТН ВЭД 표)도 찾아 넣음
+        hs = search(p.model_copy(update={"regulation": None}), "HS", glossary_terms(body.question, "HS"), k=3)
+        rows += [x for x in hs_mentions({x["article"][:4] for x in hs}, body.family) if x not in rows]
+    fmt = lambda xs: "\n---\n".join(
+        f"[{x['code']} | {x['article']}{' | p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}" for x in xs)
     out = generate(
-        model=ANSWER_MODEL, contents=(HS_ANSWER_PROMPT if body.family == "HS" else ANSWER_PROMPT).format(q=body.question, p=p.model_dump_json(), ctx=ctx, hist=hist, drw=drw),
+        model=ANSWER_MODEL, contents=(HS_ANSWER_PROMPT if body.family == "HS" else ANSWER_PROMPT).format(
+            q=body.question, p=p.model_dump_json(), ctx=fmt(rows) or "(검색 결과 없음)", hs=fmt(hs) or "(없음)", hist=hist, drw=drw),
         config=types.GenerateContentConfig(max_output_tokens=4096))  # 생각 토큰 포함 한도라 넉넉히
     return {"parsed": p, "answer": out.text,
-            "sources": [{"code": x["code"], "article": x["article"], "page": x["page"]} for x in rows]}
+            "sources": [{"code": x["code"], "article": x["article"], "page": x["page"]} for x in rows + hs]}
+
+
+def hs_mentions(heads: set[str], family: Optional[str], k=4):
+    """해당 HS 호(4자리)를 코드로 나열한 규정 조각. 코드 표는 의미 검색으로 잘 안 잡혀서 숫자로 직접 찾는다."""
+    heads = {h for h in heads if h.isdigit() and len(h) == 4}
+    if not heads:
+        return []
+    with connect() as c:
+        return c.execute(
+            "SELECT d.code, c.article, c.page, c.content FROM chunks c JOIN documents d ON d.id=c.document_id "
+            "WHERE d.status='active' AND d.family <> 'HS' AND (%s::text IS NULL OR d.family=%s) AND c.content ~ %s "
+            "ORDER BY c.id LIMIT %s", (family, family, rf"(?<!\d)({'|'.join(sorted(heads))})(?!\d)", k)).fetchall()
 
 
 # ---------- 규정 ----------
@@ -363,10 +384,10 @@ def hs_search(q: str):
             f"SELECT {HS_COLS} FROM hs_codes h, LATERAL (SELECT concat_ws(' ', h.name_ko, h.name_en) AS t) n "
             "WHERE n.t ILIKE ALL(%s) OR n.t ILIKE ANY(%s::text[]) ORDER BY h.code LIMIT 300", (words, alias)).fetchall()
         c.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
-        heads = [r["article"] for r in c.execute(
+        heads = [*dict.fromkeys(r["article"] for r in c.execute(  # 긴 호는 여러 조각이라 중복 제거
             "SELECT c.article FROM chunks c JOIN documents d ON d.id=c.document_id "
             "WHERE d.family='HS' AND d.code='HSK' AND d.status='active' ORDER BY c.embedding <=> %s LIMIT 8",
-            (emb.encode(q, normalize_embeddings=True),)).fetchall()]
+            (emb.encode(q, normalize_embeddings=True),)).fetchall())]
         rows = {r["code"]: r for r in c.execute(f"SELECT {HS_COLS} FROM hs_codes h WHERE h.code = ANY(%s::text[])", (heads,)).fetchall()}
     return {"codes": codes, "headings": [rows[h] for h in heads if h in rows]}
 
