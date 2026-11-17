@@ -89,14 +89,18 @@ class Parsed(BaseModel):
     size: Qty
     pressure: Qty
     search_text: str                       # 규정 본문 검색용 문장 (규정에서 쓰는 용어로 바꿔 쓴다)
-    # HS 품목분류 검색용: 품명·기능·작동 방식만 (규격·압력·재질 제외), 한국어와 영어 함께. 예: "볼밸브 ball valve, 수동 manually operated"
+    # HS 품목분류 검색용: 관세율표에서 쓰는 일반 품목 종류·기능으로 바꿔 한국어와 영어 함께 (규격·압력 수치 제외).
+    # 예: "볼밸브 ball valve, 수동 manually operated", "PRIMARY REFORMER SHELL" → "압력용기 pressure vessel, 개질기 reformer, 가열·화학처리 기계 machinery for treatment of materials by heating, 부분품 parts"
     product: Optional[str] = None
 
 
 PARSE_PROMPT = ("사용자 질문을 규정 검색용 JSON으로 변환하라. 질문에 없는 값(특히 단위)은 절대 추정하지 말고 null로 둔다. "
                 "search_text에는 일상 표현을 규정에서 쓰는 정식 용어로 바꿔 쓴다. "
                 "이전 대화가 있으면 이번 질문은 그 후속이므로, 이전에 나온 수치·장비·조건도 합쳐서 추출한다. "
-                "도면 사양이 첨부돼 있으면 질문에 없는 값은 도면 사양에서 채운다.")
+                "도면 사양이 첨부돼 있으면 질문에 없는 값은 도면 사양에서 채운다. "
+                "product에는 HS 품목분류 검색용으로, 품목을 관세율표에서 쓰는 일반 품목 종류와 기능으로 바꿔 한국어와 영어를 함께 쓴다 "
+                "(수치 제외. 예: 'PRIMARY REFORMER SHELL' → '압력용기 pressure vessel, 개질기 reformer, "
+                "가열 처리 기계 machinery for treatment of materials by change of temperature, 부분품 parts').")
 ANSWER_PROMPT = """너는 인증 규정 검토 보조자다. 아래 '규정 발췌'에 있는 내용만 근거로 한국어로 답하라.
 형식: 1) 결론(해당/비해당/판단불가) 2) 근거 조항(규정코드·조항) 3) 미흡하거나 추가로 필요한 정보. 간결하게 쓴다.
 수치 비교는 비교한 두 값을 명시하라. 단위가 null이거나 발췌로 판단할 수 없으면 추측하지 말고 필요한 정보를 되물어라.
@@ -117,7 +121,7 @@ ALL_PROMPT = """너는 인증·통관 검토 보조자다. 아래 'HS 참고'와
 1) 품목 요약 (질문·도면 사양에서 품명, 기능, 재질, 압력·크기 등)
 2) HS 코드 후보 (관세청 HSK 10단위, 가능성 높은 순, 근거가 된 호·소호 문구). 사용자가 코드를 지정했으면 그 코드를 따른다.
 3) 규정별 검토 표: | 규정 | 판단(해당/비해당/판단불가) | 근거 조항 | 추가로 필요한 정보 |
-   규정 발췌에 나온 규정만 표에 넣는다. 규정 표의 ТН ВЭД 코드는 HSK와 앞 6자리까지만 같으니 6자리까지만 비교한다.
+   규정 발췌 중 이 품목과 관련 있는 규정만 표에 넣고(품목과 무관한 목록 표는 빼고), 그 밖의 규정은 표 아래에 \"관련 조항 없음\"으로 이름만 적는다. 규정 표의 ТН ВЭД 코드는 HSK와 앞 6자리까지만 같으니 6자리까지만 비교한다.
    수치 비교는 비교한 두 값을 명시하고, 단위가 없거나 발췌로 판단할 수 없으면 추측하지 말고 판단불가로 두고 필요한 정보를 적는다.
 
 이전 대화:
@@ -246,10 +250,10 @@ def ask(body: Ask):
                     "HS", glossary_terms(body.question, "HS"), k=3 if one else 5)
         heads = {x["article"][:4] for x in hs} | codes_in(body.question + "\n" + hist)
         rows = []
-        # 통합 검토는 규정마다 몇 개씩 따로 뽑음 (한꺼번에 뽑으면 조각 많은 규정이 결과를 독차지함)
+        # 통합 검토는 규정 계열(family)마다 따로 뽑음 (한꺼번에 뽑으면 조각 많은 계열이 결과를 독차지함)
         for f in ([body.family] if one else active_families()):
-            got = search(p if one else p.model_copy(update={"regulation": None}), f, gl, k=10 if one else 4)
-            rows += got + [x for x in hs_mentions(heads, f, k=4 if one else 3) if x not in got]
+            got = search(p if one else p.model_copy(update={"regulation": None}), f, gl, k=10)
+            rows += got + [x for x in hs_mentions(heads, f, k=4) if x not in got]
     fmt = lambda xs: "\n---\n".join(
         f"[{x['code']} | {x['article']}{' | p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}" for x in xs)
     prompt = HS_ANSWER_PROMPT if body.family == "HS" else ANSWER_PROMPT if one else ALL_PROMPT
