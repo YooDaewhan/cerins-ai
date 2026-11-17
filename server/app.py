@@ -102,9 +102,16 @@ PARSE_PROMPT = ("사용자 질문을 규정 검색용 JSON으로 변환하라. �
                 "product에는 HS 품목분류 검색용으로, 품목을 관세율표에서 쓰는 일반 품목 종류와 기능으로 바꿔 한국어와 영어를 함께 쓴다 "
                 "(수치 제외. 예: 'PRIMARY REFORMER SHELL' → '압력용기 pressure vessel, 개질기 reformer, "
                 "가열 처리 기계 machinery for treatment of materials by change of temperature, 부분품 parts').")
+# 판단 규칙·출력 형식 (규정 질문, 통합 검토 공통). 화면이 마크다운(제목·표·굵게)을 그려 줌
+RULES = """판단 규칙:
+- 수치 비교는 비교한 두 값과 단위를 명시한다(예: 3.5 MPa > 0.05 MPa). 단위가 없는 수치는 추측하지 말고 되묻는다.
+- 등급 분류표가 발췌에 있으면 해당 표 번호와 기준값을 대조해 등급을 산정하고, 온도·재질에 따른 등급 상향 규칙도 적용한다.
+- 작동 매체·용도에서 합리적으로 추정할 수 있는 값(예: 공정가스(수소·CO 함유) → 가연성 → 1그룹)은 **가정:**으로 밝히고 판단을 진행한다.
+  '판단불가'는 결론을 가르는 핵심 정보가 정말 없을 때만 쓰고, 그때도 무엇이 확인되면 어떻게 되는지(조건부 결론)를 적는다.
+출력 형식: 마크다운. 큰 항목은 '## 제목', 비교·판단은 표(| 열 |), 핵심 결론은 **굵게**. 같은 말 반복 없이 간결하게."""
 ANSWER_PROMPT = """너는 인증 규정 검토 보조자다. 아래 '규정 발췌'에 있는 내용만 근거로 한국어로 답하라.
-형식: 1) 결론(해당/비해당/판단불가) 2) 근거 조항(규정코드·조항) 3) 미흡하거나 추가로 필요한 정보. 간결하게 쓴다.
-수치 비교는 비교한 두 값을 명시하라. 단위가 null이거나 발췌로 판단할 수 없으면 추측하지 말고 필요한 정보를 되물어라.
+형식: ## 결론 (해당/비해당/판단불가, 등급·적합성 평가 방식이 나오면 함께) ## 근거 (조항과 비교한 값을 표로) ## 추가로 필요한 정보
+""" + RULES + """
 
 이전 대화:
 {hist}
@@ -119,11 +126,14 @@ HS 참고(한국 HSK 코드표에서 질문 품목과 가까운 호. 규정 표�
 {hs}"""
 ALL_PROMPT = """너는 인증·통관 검토 보조자다. 아래 'HS 참고'와 '규정 발췌'에 있는 내용만 근거로 한국어로 답하라.
 형식:
-1) 품목 요약 (질문·도면 사양에서 품명, 기능, 재질, 압력·크기 등)
-2) HS 코드 후보 (관세청 HSK 10단위, 가능성 높은 순, 근거가 된 호·소호 문구). 사용자가 코드를 지정했으면 그 코드를 따른다.
-3) 규정별 검토 표: | 규정 | 판단(해당/비해당/판단불가) | 근거 조항 | 추가로 필요한 정보 |
-   규정 발췌 중 이 품목과 관련 있는 규정만 표에 넣고(품목과 무관한 목록 표는 빼고), 그 밖의 규정은 표 아래에 \"관련 조항 없음\"으로 이름만 적는다. 규정 표의 ТН ВЭД 코드는 HSK와 앞 6자리까지만 같으니 6자리까지만 비교한다.
-   수치 비교는 비교한 두 값을 명시하고, 단위가 없거나 발췌로 판단할 수 없으면 추측하지 말고 판단불가로 두고 필요한 정보를 적는다.
+## 품목 요약 — 표 | 항목 | 값 | (품명, 기능, 재질, 압력, 용량·크기, 온도, 작동 매체)
+## HS 코드 후보 — 표 | 순위 | HSK 코드 | 품명 | 근거 |. 사용자가 코드를 지정했으면 그 코드를 따른다.
+   부분품(예: 동체·SHELL)만인지 완성품인지에 따라 코드가 갈리면 두 경우를 모두 적는다.
+## 규정별 검토 — 표 | 규정 | 판단 | 근거 조항·비교 값 | 추가로 필요한 정보 |
+   이 품목과 관련 있는 규정만 표에 넣고(무관한 목록 표는 빼고), 그 밖의 규정은 표 아래 '관련 조항 없음: …'으로 이름만 적는다.
+   규정 표의 ТН ВЭД 코드는 HSK와 앞 6자리까지만 같으니 6자리까지만 비교한다.
+## 다음 확인 사항 — 결론을 바꿀 수 있는 정보만 짧은 목록으로.
+""" + RULES + """
 
 이전 대화:
 {hist}
@@ -136,7 +146,8 @@ HS 참고:
 규정 발췌:
 {ctx}"""
 HS_ANSWER_PROMPT = """너는 HS 품목분류 보조자다. 아래 'HS 코드표 발췌'(관세청 HSK 10단위·한글 품명, 상위는 영문)만 근거로 한국어로 답하라.
-형식: 1) 후보 HS 코드(10단위, 가능성 높은 순, 각 코드의 품명) 2) 근거(어느 호·소호의 어떤 문구에 해당하는지) 3) 확정에 필요한 추가 정보(재질·용도·작동 방식 등).
+형식(마크다운): ## 후보 HS 코드 — 표 | 순위 | HSK 코드 | 품명 | 근거(호·소호 문구) | ## 확정에 필요한 추가 정보 — 짧은 목록.
+부분품(동체·SHELL 등)만인지 완성품인지에 따라 코드가 갈리면 두 경우를 모두 적는다. 핵심 결론은 **굵게**.
 도면 사양이 있으면 재질·작동 방식·용도·크기를 하위 코드의 구분 기준(예: 전기 작동식/액압 작동식, 스테인리스/주철)과 하나씩 대조해 어느 코드인지 고르고, 도면에 없어 고를 수 없는 기준은 무엇인지 적어라.
 발췌에 없는 코드는 만들지 마라. 품목분류는 관세율표 해석 통칙과 부·류 주(註)로 최종 결정되므로, 애매하면 단정하지 말고 관세청 사전심사를 권하라.
 
@@ -256,6 +267,8 @@ def ask(body: Ask):
             # 일반 품목명(압력용기 등)도 함께 넣어야 고유 장비명(PRIMARY REFORMER)만으로 놓치는 규정을 찾음
             got = search(p if one else p.model_copy(update={"regulation": None}), f, gl + [p.product or ""], k=10)
             rows += got + [x for x in hs_mentions(heads, f, k=4) if x not in got]
+        if p.pressure.value is not None or (body.drawing and "압력" in body.drawing):
+            rows += pressure_tables(body.family if one else None)
     fmt = lambda xs: "\n---\n".join(
         f"[{x['code']} | {x['article']}{' | p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}" for x in xs)
     prompt = HS_ANSWER_PROMPT if body.family == "HS" else ANSWER_PROMPT if one else ALL_PROMPT
@@ -265,6 +278,24 @@ def ask(body: Ask):
         config=types.GenerateContentConfig(max_output_tokens=6144))  # 생각 토큰 포함 한도라 넉넉히
     return {"parsed": p, "answer": out.text,
             "sources": [{"code": x["code"], "article": x["article"], "page": x["page"]} for x in rows + hs]}
+
+
+# 압력 수치가 있는 질문이면 항상 통째로 넣는 등급 분류표 (61조각으로 쪼개져 의미 검색으로는 일부만 잡힘)
+PRESSURE_TABLES = [("TR CU 032/2013", "Appendix No. 1%")]
+LABEL_LINE = re.compile(r'^\[|^to the Technical Regulations|^of the Customs|^Union "On the Safet')  # 조각 머리말 줄
+
+
+def pressure_tables(family: Optional[str]):
+    out = []
+    with connect() as c:
+        for code, art in PRESSURE_TABLES:
+            rows = c.execute(
+                "SELECT c.content FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.code=%s AND d.status='active' "
+                "AND (%s::text IS NULL OR d.family=%s) AND c.article LIKE %s ORDER BY c.id", (code, family, family, art)).fetchall()
+            text = "\n".join(l for r in rows for l in r["content"].splitlines() if l.strip() and not LABEL_LINE.match(l))
+            if text:
+                out.append({"code": code, "article": f"{art.rstrip('%').strip()} (등급 분류표 전체)", "page": None, "content": text})
+    return out
 
 
 def codes_in(text: str) -> set[str]:
