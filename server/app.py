@@ -95,7 +95,8 @@ class Parsed(BaseModel):
 
 
 PARSE_PROMPT = ("사용자 질문을 규정 검색용 JSON으로 변환하라. 질문에 없는 값(특히 단위)은 절대 추정하지 말고 null로 둔다. "
-                "search_text에는 일상 표현을 규정에서 쓰는 정식 용어로 바꿔 쓴다. "
+                "search_text에는 일상 표현을 규정에서 쓰는 정식 용어로 바꿔 쓴다. 품목과 사양만 쓰고 "
+                "'HS 코드', '적용 여부', '검토', 'applicability' 같은 질문 표현은 넣지 않는다. "
                 "이전 대화가 있으면 이번 질문은 그 후속이므로, 이전에 나온 수치·장비·조건도 합쳐서 추출한다. "
                 "도면 사양이 첨부돼 있으면 질문에 없는 값은 도면 사양에서 채운다. "
                 "product에는 HS 품목분류 검색용으로, 품목을 관세율표에서 쓰는 일반 품목 종류와 기능으로 바꿔 한국어와 영어를 함께 쓴다 "
@@ -252,7 +253,8 @@ def ask(body: Ask):
         rows = []
         # 통합 검토는 규정 계열(family)마다 따로 뽑음 (한꺼번에 뽑으면 조각 많은 계열이 결과를 독차지함)
         for f in ([body.family] if one else active_families()):
-            got = search(p if one else p.model_copy(update={"regulation": None}), f, gl, k=10)
+            # 일반 품목명(압력용기 등)도 함께 넣어야 고유 장비명(PRIMARY REFORMER)만으로 놓치는 규정을 찾음
+            got = search(p if one else p.model_copy(update={"regulation": None}), f, gl + [p.product or ""], k=10)
             rows += got + [x for x in hs_mentions(heads, f, k=4) if x not in got]
     fmt = lambda xs: "\n---\n".join(
         f"[{x['code']} | {x['article']}{' | p.' + str(x['page']) if x['page'] else ''}]\n{x['content']}" for x in xs)
